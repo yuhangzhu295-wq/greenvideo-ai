@@ -1,0 +1,23 @@
+{
+  "name": "greenvideo-ai",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GreenVideo AI miniapp, API, and media task services.",
+  "scripts": {
+    "lint": "pnpm --filter @greenvideo/miniapp lint",
+    "typecheck": "pnpm --filter @greenvideo/miniapp typecheck",
+    "build:weapp": "pnpm --filter @greenvideo/miniapp build:weapp",
+    "dev:h5": "pnpm --filter @greenvideo/miniapp dev:h5",
+    "verify": "bash scripts/verify.sh",
+    "start:local": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-local.ps1",
+    "start:local:watch": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-local.ps1 -Watch",
+    "stop:local": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-local.ps1"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "apps/*"
+  ],
+  "packageManager": "pnpm@10.18.3"
+}

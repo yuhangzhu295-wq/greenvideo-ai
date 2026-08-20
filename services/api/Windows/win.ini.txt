@@ -1,0 +1,2 @@
+GreenVideo AI demo result file.
+真实生产环境会在这里返回签名下载文件。

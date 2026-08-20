@@ -1,0 +1,38 @@
+node_modules/
+dist/
+.npmrc
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# Editor
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+
+# Taro
+.temp/
+.rn_temp/
+/apps/miniapp/dist/
+/apps/miniapp/dist-h5/
+/apps/miniapp/.npm/
+/apps/miniapp/.rn_temp/
+
+# Storage
+storage/
+artifacts/
