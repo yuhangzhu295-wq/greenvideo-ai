@@ -8,6 +8,11 @@ client = TestClient(app)
 
 
 def test_parse_to_download_to_history_flow() -> None:
+    """Download is unimplemented: the flow must record an honest failure.
+
+    The task still appears in history (so the user can see what happened), but
+    it is marked failed and no file is offered.
+    """
     parsed = client.post("/api/parse", json={"text": "https://example.com/demo"}).json()
     task = client.post(
         "/api/tasks/download",

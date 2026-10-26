@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime
+import shutil
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from pydantic import ValidationError
 
@@ -25,9 +26,11 @@ from app.schemas import (
     MaskRegion,
     TaskCreateResponse,
     TaskStatusDTO,
+    TimedMaskRegion,
     WatermarkTaskRequest,
 )
 from app.services.storage import new_id, output_name, safe_upload_name, storage_path
+from app.services.video_repair import AiServiceCancelled
 from app.services.watermark import WatermarkProcessor, is_video_path
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
@@ -35,7 +38,13 @@ router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 ALLOWED_UPLOAD_EXT = {".mp4", ".mov", ".avi", ".jpg", ".jpeg", ".png"}
 IMAGE_EXT = {".jpg", ".jpeg", ".png"}
 VIDEO_EXT = {".mp4", ".mov", ".avi"}
-processor = WatermarkProcessor()
+# A watermark is a small overlay. Anything covering more than this share of the
+# frame is scene structure the detector mistook for one.
+AUTO_DETECT_MAX_COVERAGE_PCT = 15.0
+# Hand-picked regions get a looser ceiling than auto-detection (a user may
+# legitimately select a wide band), but still bounded so a mistake cannot mask
+# the whole frame.
+MANUAL_MAX_COVERAGE_PCT = 60.0
 
 
 def _eta(progress: int) -> int:
@@ -74,50 +83,218 @@ def _safe_stage(task_id: str, progress: int, stage: str) -> None:
     update_task(task_id, status="processing", progress=progress, stage=stage)
 
 
-def _write_demo_result(path: Path, title: str, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        f"GreenVideo AI {title}\n"
-        f"生成时间: {datetime.now(UTC).isoformat()}\n"
-        f"任务参数: {json.dumps(payload, ensure_ascii=False)}\n"
-        "说明: 当前环境没有执行真实平台下载，已生成 demo/fallback 结果文件。\n",
-        encoding="utf-8",
-    )
+def _stage_from_engine(engine: str, note: str, fallback: str) -> str:
+    """Report the engine that actually ran, never implying an engine that did not."""
+    note = note or ""
+    if engine == "none":
+        return f"未执行去水印：{note}" if note else "未执行去水印"
+    if engine == "opencv" and "降级" in note:
+        return note
+    if engine == "iopaint-lama":
+        return note or f"已使用 IOPaint LaMa 执行 AI 修复（引擎：{engine}）"
+    return f"{fallback}（引擎：{engine}）{('；' + note) if note and note not in fallback else ''}"
+
+
+def _timed_region_peak_coverage_pct(regions, width: int, height: int) -> float:
+    """Largest share of the frame covered at any single point in time.
+
+    Time-scoped regions apply to different windows, so the union of all of them
+    would overstate the exposure. The peak matters because that is what a frame
+    is actually repaired against.
+    """
+    if not regions or width <= 0 or height <= 0:
+        return 0.0
+    boundaries = sorted({r.start_s for r in regions}
+                        | {r.end_s for r in regions if r.end_s is not None})
+    peak = 0.0
+    for t in boundaries:
+        active = [
+            r for r in regions
+            if r.start_s <= t and (r.end_s is None or t < r.end_s)
+        ]
+        if not active:
+            continue
+        canvas = np.zeros((height, width), dtype=bool)
+        for r in active:
+            x1 = max(0, min(width, r.x))
+            y1 = max(0, min(height, r.y))
+            x2 = max(0, min(width, r.x + r.w))
+            y2 = max(0, min(height, r.y + r.h))
+            if x2 > x1 and y2 > y1:
+                canvas[y1:y2, x1:x2] = True
+        peak = max(peak, float(canvas.mean()))
+    return 100.0 * peak
+
+def _probe_frame_size(path: Path) -> tuple[int, int]:
+    """(width, height) of a video's first stream, or (0, 0) when unknown."""
+    try:
+        import cv2
+
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            cap.release()
+            return 0, 0
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        cap.release()
+        return w, h
+    except Exception:
+        return 0, 0
+
+def _region_coverage_pct(regions: list[MaskRegion], width: int = 0, height: int = 0) -> float:
+    """Share of the frame covered by the union of the given regions."""
+    if not regions:
+        return 0.0
+    if width <= 0 or height <= 0:
+        max_x = max(r.x + r.w for r in regions)
+        max_y = max(r.y + r.h for r in regions)
+        width = max(width, max_x)
+        height = max(height, max_y)
+    if width <= 0 or height <= 0:
+        return 0.0
+    canvas = np.zeros((height, width), dtype=bool)
+    for r in regions:
+        x1 = max(0, min(width, r.x))
+        y1 = max(0, min(height, r.y))
+        x2 = max(0, min(width, r.x + r.w))
+        y2 = max(0, min(height, r.y + r.h))
+        if x2 > x1 and y2 > y1:
+            canvas[y1:y2, x1:x2] = True
+    return 100.0 * float(canvas.mean())
+
+def _discard_output(output: Path | None) -> None:
+    """Remove an unfinished output so a failed task never leaves a file behind."""
+    if output is None:
+        return
+    try:
+        Path(output).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _detect_source_watermark(source_path: Path):
+    """Sample frames from the upload and locate persistent watermark regions."""
+    import cv2
+
+    from app.services.watermark_detect import detect_watermarks
+
+    cap = cv2.VideoCapture(str(source_path))
+    if not cap.isOpened():
+        cap.release()
+        from app.services.watermark_detect import DetectionResult
+
+        return DetectionResult(False, "无法解码上传视频", [], None, None, 0, {})
+
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    frames: list = []
+    if total > 40:
+        step = max(1, total // 30)
+        idx = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if idx % step == 0 and len(frames) < 30:
+                frames.append(frame)
+            idx += 1
+    else:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frames.append(frame)
+    cap.release()
+
+    if not frames:
+        from app.services.watermark_detect import DetectionResult
+
+        return DetectionResult(False, "视频中没有可解码帧", [], None, None, 0, {})
+    return detect_watermarks(frames)
 
 
 async def _run_download_task(task_id: str, payload: DownloadTaskRequest) -> None:
-    try:
-        _safe_stage(task_id, 12, "读取解析结果")
-        await asyncio.sleep(0.05)
-        parsed = get_parse_result(payload.parse_id)
-        ext = "mp3" if payload.format_id.lower() == "mp3" else "mp4"
-        output = storage_path("files", output_name(task_id, ext))
+    """Download a public video/audio the user asked for, with yt-dlp.
 
-        _safe_stage(task_id, 45, "生成下载文件")
-        await asyncio.sleep(0.05)
-        title = parsed.title if parsed else "演示视频"
-        _write_demo_result(
-            output,
-            "download result",
-            {
-                "parse_id": payload.parse_id,
-                "format_id": payload.format_id,
-                "title": title,
-                "is_demo": True,
-            },
+    The result is only reported as completed when a real, decodable file was
+    produced. Every refusal (login/DRM/rate limit/no yt-dlp) is surfaced as a
+    business error, never as a demo file dressed up as a finished download.
+    """
+    from app.services.downloader import DownloadError, VideoDownloader
+
+    output_dir = storage_path("files", f"dl_{task_id}")
+    try:
+        parsed = get_parse_result(payload.parse_id)
+        if parsed is None:
+            raise DownloadError(
+                "PARSE_RESULT_EXPIRED", "解析结果不存在或已过期，请重新解析后再下载。"
+            )
+
+        _safe_stage(task_id, 20, "准备下载")
+        downloader = VideoDownloader()
+
+        def progress(pct: int, stage: str) -> None:
+            _safe_stage(task_id, pct, stage)
+
+        def canceled() -> bool:
+            task = get_task(task_id)
+            return bool(task and task.status == "canceled")
+
+        produced = await asyncio.to_thread(
+            downloader.download,
+            parsed.url,
+            payload.format_id,
+            output_dir,
+            progress,
+            canceled,
         )
+
+        # The produced file must be real media, not a zero-byte or header-only
+        # artifact that merely exists on disk.
+        from app.services.video_repair import count_decoded_frames
+
+        ext = produced.suffix.lower()
+        if ext == ".mp3":
+            from app.services.watermark import _audio_stream_status
+
+            if _audio_stream_status(produced) != "present":
+                raise DownloadError(
+                    "DOWNLOAD_FAILED", "下载得到的音频文件没有可解码音轨，未提供下载结果。"
+                )
+        else:
+            decoded = count_decoded_frames(produced)
+            if decoded is None or decoded <= 0:
+                raise DownloadError(
+                    "DOWNLOAD_FAILED", "下载得到的文件没有可解码视频帧，未提供下载结果。"
+                )
+
+        final = storage_path("files", output_name(task_id, ext.lstrip(".") or "mp4"))
+        shutil.move(str(produced), str(final))
+        shutil.rmtree(output_dir, ignore_errors=True)
 
         update_task(
             task_id,
             status="completed",
             progress=100,
-            stage="处理完成",
-            output_path=str(output),
+            stage="下载完成",
+            output_path=str(final),
         )
-        update_history_by_task(task_id, status="success", size_mb=_size_mb(output, 0.01))
-    except Exception as exc:
-        update_task(task_id, status="failed", stage="处理失败", error=str(exc))
+        update_history_by_task(
+            task_id, status="success", size_mb=_size_mb(final, 0.01)
+        )
+    except DownloadError as exc:
+        update_task(
+            task_id,
+            status="failed",
+            progress=100,
+            stage="下载失败",
+            error=f"[{exc.code}] {exc.message}",
+        )
         update_history_by_task(task_id, status="failed")
+        shutil.rmtree(output_dir, ignore_errors=True)
+    except Exception as exc:
+        update_task(task_id, status="failed", progress=100, stage="下载失败", error=str(exc))
+        update_history_by_task(task_id, status="failed")
+        shutil.rmtree(output_dir, ignore_errors=True)
 
 
 @router.post("/download", response_model=TaskCreateResponse)
@@ -205,6 +382,22 @@ def _parse_mask_regions(raw: Any) -> list[MaskRegion]:
     return [MaskRegion.model_validate(item) for item in data]
 
 
+def _parse_timed_mask_regions(raw: Any) -> list[TimedMaskRegion]:
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return [TimedMaskRegion.model_validate(item) for item in raw]
+    try:
+        data = json.loads(str(raw))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_TIMED_MASK_REGIONS",
+                    "message": "timed_mask_regions 必须是 JSON 数组。"},
+        ) from exc
+    return [TimedMaskRegion.model_validate(item) for item in data]
+
+
 async def _load_watermark_payload(request: Request) -> tuple[WatermarkTaskRequest, Path | None]:
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
@@ -229,10 +422,12 @@ async def _load_watermark_payload(request: Request) -> tuple[WatermarkTaskReques
             parse_id=str(form.get("parse_id") or "") or None,
             video_url=str(form.get("video_url") or "") or None,
             mask_regions=_parse_mask_regions(form.get("mask_regions")),
+            timed_mask_regions=_parse_timed_mask_regions(form.get("timed_mask_regions")),
             mask_preset=str(form.get("mask_preset") or "douyin_both_corners"),
             repair_mode=mode_value,
             remove_subtitle=_parse_bool(form.get("remove_subtitle")),
             confirm_authorized=_parse_bool(form.get("confirm_authorized")),
+            auto_detect=_parse_bool(form.get("auto_detect")),
         )
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
@@ -256,6 +451,10 @@ async def _run_watermark_task(
     payload: WatermarkTaskRequest,
     source_path: Path | None,
 ) -> None:
+    # A processor per task: the engine result is instance state, so sharing one
+    # object between concurrent tasks let one task's failure be overwritten by
+    # another's success before it was read.
+    processor = WatermarkProcessor()
     try:
         _safe_stage(task_id, 8, "准备素材")
         await asyncio.sleep(0.05)
@@ -263,17 +462,141 @@ async def _run_watermark_task(
         output_suffix = ".mp4" if suffix in VIDEO_EXT else suffix if suffix in IMAGE_EXT else ".txt"
         output = storage_path("files", output_name(task_id, output_suffix))
 
+        # Auto-detection: locate the watermark before repairing. If the detector
+        # cannot find a confident region the task fails instead of masking the
+        # whole picture.
+        mask_regions = list(payload.mask_regions)
+        mask_preset = payload.mask_preset
+        frame_width = frame_height = 0
+        # Auto-detection and hand-picked time-scoped regions describe the same
+        # thing (where to repair) in two different ways. Allowing both lets the
+        # detector's result be gated while the submitted regions - which the
+        # processor prefers - bypass that gate entirely.
+        if payload.auto_detect and payload.timed_mask_regions:
+            update_task(
+                task_id,
+                status="failed",
+                progress=100,
+                stage="参数冲突",
+                error="自动检测与手动分时区域不能同时使用，请只选择其中一种。",
+            )
+            update_history_by_task(task_id, status="failed")
+            return
+        if payload.auto_detect and source_path and suffix in VIDEO_EXT:
+            _safe_stage(task_id, 12, "正在检测水印区域")
+            frame_width, frame_height = _probe_frame_size(source_path)
+            detection = await asyncio.to_thread(
+                _detect_source_watermark, source_path
+            )
+            if not detection.ok:
+                update_task(
+                    task_id,
+                    status="failed",
+                    progress=100,
+                    stage="水印检测失败",
+                    error=f"{detection.reason}（stats: {detection.stats}）",
+                )
+                update_history_by_task(task_id, status="failed")
+                return
+            mask_preset = "custom"
+            mask_regions = [
+                MaskRegion(x=det.box[0], y=det.box[1], w=det.box[2], h=det.box[3])
+                for det in detection.detections
+            ]
+            if not mask_regions:
+                update_task(
+                    task_id,
+                    status="failed",
+                    progress=100,
+                    stage="水印检测失败",
+                    error=f"{detection.reason}（stats: {detection.stats}）",
+                )
+                update_history_by_task(task_id, status="failed")
+                return
+
+            # A detector that reports most of the frame has found scene structure,
+            # not a watermark. Repairing that would destroy the picture, so the
+            # task fails and asks for a manual region instead of proceeding.
+            coverage_pct = _region_coverage_pct(mask_regions, frame_width, frame_height)
+            if coverage_pct > AUTO_DETECT_MAX_COVERAGE_PCT:
+                update_task(
+                    task_id,
+                    status="failed",
+                    progress=100,
+                    stage="水印检测结果不可信",
+                    error=(
+                        f"自动检测到的区域覆盖 {coverage_pct:.1f}% 画面，超过 "
+                        f"{AUTO_DETECT_MAX_COVERAGE_PCT}% 可信上限，疑似误检。"
+                        "请手动选择水印区域后重试。"
+                    ),
+                )
+                update_history_by_task(task_id, status="failed")
+                return
+
+            _safe_stage(
+                task_id,
+                16,
+                f"已自动检测到 {len(mask_regions)} 个水印区域"
+                f"（覆盖 {coverage_pct:.1f}% 画面），开始修复",
+            )
+            # Record what the detector actually produced so the run can be
+            # audited later instead of only showing the pre-detection payload.
+            update_task(
+                task_id,
+                input={
+                    **payload.model_dump(),
+                    "auto_detect_regions": [r.model_dump() for r in mask_regions],
+                    "source_path": str(source_path) if source_path else None,
+                },
+            )
+
+        # The same sanity gate applies to hand-submitted time-scoped regions: a
+        # region set covering most of the frame is a mistake, not a watermark,
+        # and repairing it would destroy the picture.
+        if payload.timed_mask_regions and source_path and suffix in VIDEO_EXT:
+            if frame_width <= 0 or frame_height <= 0:
+                frame_width, frame_height = _probe_frame_size(source_path)
+            timed_coverage = _timed_region_peak_coverage_pct(
+                payload.timed_mask_regions, frame_width, frame_height
+            )
+            if timed_coverage > MANUAL_MAX_COVERAGE_PCT:
+                update_task(
+                    task_id,
+                    status="failed",
+                    progress=100,
+                    stage="遮罩区域过大",
+                    error=(
+                        f"分时遮罩最大覆盖 {timed_coverage:.1f}% 画面，超过 "
+                        f"{MANUAL_MAX_COVERAGE_PCT}% 上限。水印通常只占画面很小一部分，"
+                        "请确认区域是否选得过大。"
+                    ),
+                )
+                update_history_by_task(task_id, status="failed")
+                return
+
+        # The processor object is shared between concurrent tasks, so the engine
+        # state must be captured immediately after this task's own call instead
+        # of being read later.
+        engine = "unknown"
+        engine_note = ""
+
+        def is_canceled() -> bool:
+            task = get_task(task_id)
+            return task is not None and task.status == "canceled"
+
         if source_path and suffix in IMAGE_EXT:
-            _safe_stage(task_id, 20, "OpenCV 图片修复中")
+            _safe_stage(task_id, 20, "图片修复中")
             await asyncio.to_thread(
                 processor.process_image,
                 source_path,
-                payload.mask_regions,
+                mask_regions,
                 output,
                 payload.repair_mode,
-                payload.mask_preset,
+                mask_preset,
                 payload.remove_subtitle,
             )
+            engine = processor.last_engine
+            engine_note = processor.last_engine_note
         elif source_path and suffix in VIDEO_EXT and is_video_path(source_path):
             def progress(progress: int, stage: str) -> None:
                 _safe_stage(task_id, progress, stage)
@@ -281,28 +604,69 @@ async def _run_watermark_task(
             await asyncio.to_thread(
                 processor.process_video,
                 source_path,
-                payload.mask_regions,
+                mask_regions,
                 output,
                 progress,
                 payload.repair_mode,
-                payload.mask_preset,
+                mask_preset,
                 payload.remove_subtitle,
+                is_canceled,
+                payload.timed_mask_regions,
             )
+            engine = processor.last_engine
+            engine_note = processor.last_engine_note
         else:
-            _safe_stage(task_id, 62, "生成演示修复结果")
-            _write_demo_result(output, "watermark result", payload.model_dump())
+            # No usable media was supplied. Writing a demo text file and calling
+            # the task "completed" would be a fake success, so the task fails.
+            update_task(
+                task_id,
+                status="failed",
+                progress=100,
+                stage="缺少可处理的素材",
+                error="未收到可处理的视频或图片文件，任务未执行。",
+            )
+            update_history_by_task(task_id, status="failed")
+            return
+
+        # Never report success when no repair engine actually ran.
+        if engine == "none":
+            update_task(
+                task_id,
+                status="failed",
+                progress=100,
+                stage="未执行去水印",
+                error=engine_note or "去水印引擎不可用，未修改原始文件。",
+                output_path=str(output),
+            )
+            update_history_by_task(task_id, status="failed")
+            return
 
         update_task(
             task_id,
             status="completed",
             progress=100,
-            stage="处理完成",
+            stage=_stage_from_engine(engine, engine_note, "处理完成"),
             output_path=str(output),
         )
         update_history_by_task(task_id, status="success", size_mb=_size_mb(output, 0.01))
+    except AiServiceCancelled:
+        # Must precede `except Exception`: the user canceled the task, so it
+        # stays canceled and the partial output is dropped rather than reported
+        # as a finished file.
+        update_task(
+            task_id,
+            status="canceled",
+            progress=100,
+            stage="已取消",
+            error="用户已取消",
+            output_path=None,
+        )
+        update_history_by_task(task_id, status="failed")
+        _discard_output(output)
     except Exception as exc:
         update_task(task_id, status="failed", stage="处理失败", error=str(exc))
         update_history_by_task(task_id, status="failed")
+        _discard_output(output)
 
 
 @router.post("/watermark", response_model=TaskCreateResponse)

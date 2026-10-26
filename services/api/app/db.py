@@ -48,9 +48,33 @@ def get_session() -> Iterable[Session]:
             raise
 
 
+def _add_missing_columns() -> None:
+    """Add columns that were introduced after the database was first created.
+
+    SQLModel's create_all only creates missing tables, never alters existing
+    ones, so an installed database would keep the old schema and every query
+    touching a new column would fail.
+    """
+    from sqlalchemy import inspect, text
+
+    existing_tables = set(inspect(engine).get_table_names())
+    additions = {
+        "parse_results": {"url": "TEXT"},
+    }
+    with engine.begin() as conn:
+        for table, columns in additions.items():
+            if table not in existing_tables:
+                continue
+            present = {c["name"] for c in inspect(engine).get_columns(table)}
+            for name, ddl in columns.items():
+                if name not in present:
+                    conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {ddl}'))
+
+
 def init_db() -> None:
     ensure_storage()
     SQLModel.metadata.create_all(engine)
+    _add_missing_columns()
     seed_demo_data()
 
 
@@ -128,6 +152,7 @@ def insert_parse_result(row: dict) -> None:
     parsed = ParseResult(
         id=row["id"],
         url_hash=row["url_hash"],
+        url=row.get("url"),
         title=row["title"],
         source=row["source"],
         thumbnail=row["thumbnail"],

@@ -113,10 +113,12 @@ export async function uploadWatermarkFile(
       name: "file",
       formData: {
         mask_regions: JSON.stringify(options.mask_regions || []),
+        timed_mask_regions: JSON.stringify(options.timed_mask_regions || []),
         mask_preset: options.mask_preset || "douyin_both_corners",
         repair_mode: options.repair_mode || "opencv",
         remove_subtitle: String(Boolean(options.remove_subtitle)),
         confirm_authorized: String(Boolean(options.confirm_authorized)),
+        auto_detect: String(Boolean(options.auto_detect)),
         parse_id: options.parse_id || "",
         source_task_id: options.source_task_id || "",
         video_url: options.video_url || ""
@@ -134,9 +136,8 @@ export async function uploadWatermarkFile(
     }
     return JSON.parse(String(response.data)) as { task_id: string; status: string };
   } catch (err) {
-    if (IS_DEMO_MODE || (err instanceof Error && err.message === "DEMO_FALLBACK")) {
-      return delay({ task_id: "task_watermark_demo", status: "queued" });
-    }
+    // A failed upload must surface as an error. Returning a demo task id here
+    // would show the user a fake task that never runs a real engine.
     throw new Error(networkMessage(err));
   }
 }
@@ -144,28 +145,18 @@ export async function uploadWatermarkFile(
 export async function createWatermarkTask(
   payload: WatermarkPayload = {}
 ): Promise<{ task_id: string; status: string }> {
-  try {
-    return await request<{ task_id: string; status: string }>("/api/tasks/watermark", {
-      method: "POST",
-      data: payload
-    });
-  } catch (err) {
-    if (err instanceof Error && err.message === "DEMO_FALLBACK") {
-      return delay({ task_id: "task_watermark_demo", status: "queued" });
-    }
-    throw err;
-  }
+  // A failed create must surface as an error; returning a demo task id would
+  // show the user a task that never runs.
+  return request<{ task_id: string; status: string }>("/api/tasks/watermark", {
+    method: "POST",
+    data: payload
+  });
 }
 
 export async function getTask(taskId: string): Promise<TaskStatus> {
-  try {
-    return await request<TaskStatus>(`/api/tasks/${taskId}`);
-  } catch (err) {
-    if (err instanceof Error && err.message === "DEMO_FALLBACK") {
-      return delay({ ...mockTask, task_id: taskId || mockTask.task_id });
-    }
-    throw err;
-  }
+  // Polling must report the real backend state; a mock task would let the UI
+  // claim progress for a task that never ran.
+  return request<TaskStatus>(`/api/tasks/${taskId}`);
 }
 
 export async function cancelTask(taskId: string): Promise<{ ok: boolean }> {

@@ -84,7 +84,7 @@ export default function ResultPage() {
               <View className='download-text'>
                 <View>{format.label}</View>
                 <View className='muted'>
-                  {format.ext.toUpperCase()} 格式 · {format.size_mb} MB
+                  {format.ext.toUpperCase()} 格式 · {format.size_mb > 0 ? `${format.size_mb} MB` : "大小未知"}
                 </View>
               </View>
               <Button

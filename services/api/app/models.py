@@ -31,6 +31,10 @@ class ParseResult(SubscriptableModel, table=True):
     __tablename__ = "parse_results"
     id: str = Field(primary_key=True)
     url_hash: str
+    # The source URL is needed by the download task. Storing only its hash made
+    # a real download impossible, which is why the download step had no honest
+    # implementation.
+    url: str | None = Field(default=None, nullable=True)
     title: str
     source: str
     thumbnail: str

@@ -3,10 +3,43 @@ from __future__ import annotations
 import json
 import sys
 import time
+import uuid
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
+SMOKE_VIDEO = Path(__file__).resolve().parent / "fixtures" / "smoke_watermark.mp4"
+
+
+def multipart_request(path: str, fields: dict[str, str], file_path: Path) -> dict:
+    """POST a multipart/form-data body carrying a real media file."""
+    boundary = f"----GreenVideoSmoke{uuid.uuid4().hex}"
+    parts: list[bytes] = []
+    for key, value in fields.items():
+        parts.append(f"--{boundary}\r\n".encode())
+        parts.append(f'Content-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode())
+    parts.append(f"--{boundary}\r\n".encode())
+    parts.append(
+        (
+            f'Content-Disposition: form-data; name="file"; filename="{file_path.name}"\r\n'
+            f"Content-Type: video/mp4\r\n\r\n"
+        ).encode()
+    )
+    parts.append(file_path.read_bytes())
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    req = Request(
+        f"{BASE_URL}{path}",
+        data=b"".join(parts),
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urlopen(req, timeout=180) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        message = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"POST {path} failed: {exc.code} {message}") from exc
 
 
 def request(method: str, path: str, payload: dict | None = None, raw: bool = False) -> bytes | dict:
@@ -63,20 +96,26 @@ def main() -> None:
     assert b"GreenVideo AI" in file_bytes
     print("Download task: OK")
 
-    watermark = request(
-        "POST",
+    # Upload a real decodable video so the watermark task exercises the actual
+    # repair engine instead of copying the download task's demo text file.
+    if not SMOKE_VIDEO.exists():
+        raise RuntimeError(f"Smoke fixture video missing: {SMOKE_VIDEO}")
+    watermark = multipart_request(
         "/api/tasks/watermark",
         {
-            "source_task_id": download["task_id"],
             "mask_preset": "douyin_both_corners",
             "repair_mode": "opencv",
-            "remove_subtitle": False,
-            "confirm_authorized": True,
+            "remove_subtitle": "false",
+            "confirm_authorized": "true",
         },
+        SMOKE_VIDEO,
     )
-    watermark_status = wait_task(watermark["task_id"])
-    assert watermark_status["status"] in {"completed", "success"}
-    assert len(request("GET", watermark_status["download_url"], raw=True)) > 0
+    watermark_status = wait_task(watermark["task_id"], timeout=180.0)
+    assert watermark_status["status"] in {"completed", "success"}, watermark_status
+    watermark_bytes = request("GET", watermark_status["download_url"], raw=True)
+    assert len(watermark_bytes) > 0
+    # A real repair must not return the untouched source bytes.
+    assert watermark_bytes != SMOKE_VIDEO.read_bytes()
     print("Watermark task: OK")
 
     feedback = request(

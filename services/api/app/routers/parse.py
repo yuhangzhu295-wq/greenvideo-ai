@@ -37,6 +37,7 @@ def parse_video(payload: ParseRequest) -> ParseResultDTO:
         {
             "id": result.id,
             "url_hash": hashlib.sha256(clean_url.encode("utf-8")).hexdigest(),
+            "url": clean_url,
             "title": result.title,
             "source": result.source or platform,
             "thumbnail": result.thumbnail,

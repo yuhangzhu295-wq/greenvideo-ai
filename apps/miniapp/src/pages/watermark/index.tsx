@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { Button, Text, View } from "@tarojs/components";
+import { Button, Input, Text, View } from "@tarojs/components";
 import Taro from "@tarojs/taro";
 import { parseVideo, uploadWatermarkFile } from "@/api/client";
 import type { WatermarkPayload } from "@/api/types";
@@ -15,12 +15,88 @@ const presetOptions: Array<{ value: Preset; label: string; desc: string }> = [
   { value: "custom", label: "自定义区域", desc: "仅使用手动区域参数" }
 ];
 
+/**
+ * Regions for the chosen preset, expressed as fractions of the real frame so
+ * they scale to whatever the user picked. "both corners" yields two regions so
+ * neither corner is skipped.
+ *
+ * The bottom-right band reaches the frame edge on purpose: platform watermarks
+ * sit flush against it, and a box that stops short leaves the tail of the ID
+ * text in place.
+ */
+function presetRegions(
+  preset: Preset,
+  W: number,
+  H: number
+): Array<{ x: number; y: number; w: number; h: number }> {
+  const topLeft = { x: 0, y: 0, w: Math.round(W * 0.42), h: Math.round(H * 0.20) };
+  const bottomRight = {
+    x: Math.round(W * 0.55),
+    y: Math.round(H * 0.76),
+    w: W - Math.round(W * 0.55),
+    h: H - Math.round(H * 0.76)
+  };
+  if (preset === "douyin_bottom_right") return [bottomRight];
+  if (preset === "douyin_both_corners") return [topLeft, bottomRight];
+  return [topLeft];
+}
+
+/**
+ * Two-phase mask for clips whose watermark moves to the centre at the end. The
+ * content phase reuses the selected preset regions; the end-card phase covers
+ * the centred block.
+ *
+ * `splitSeconds` comes from the caller: a fixed constant would leave short
+ * clips without any end-card coverage at all.
+ */
+function buildTimedRegions(
+  preset: Preset,
+  mediaSize: { width: number; height: number } | null,
+  splitSeconds: number
+): Array<{
+  x: number; y: number; w: number; h: number; start_s: number; end_s?: number;
+}> {
+  // Without the real frame size the regions would be calibrated for another
+  // resolution and silently miss the watermark, so the caller is told to pick
+  // the file again rather than defaulting to a guess.
+  if (!mediaSize || mediaSize.width <= 0 || mediaSize.height <= 0) {
+    throw new Error("无法获取视频尺寸，请重新选择素材后再开启分时处理");
+  }
+  const W = mediaSize.width;
+  const H = mediaSize.height;
+  const split = Math.max(0.1, splitSeconds);
+  const head = presetRegions(preset, W, H).map((r) => ({ ...r, start_s: 0, end_s: split }));
+  const cardY = Math.round(H * 0.21);
+  return [
+    ...head,
+    {
+      x: Math.round(W * 0.19),
+      y: cardY,
+      w: Math.round(W * 0.62),
+      // Reach the frame bottom: an end-card watermark can sit flush against it,
+      // and stopping short leaves part of the logo in place.
+      h: H - cardY,
+      start_s: split
+    }
+  ];
+}
+
 export default function WatermarkPage() {
   const [filePath, setFilePath] = useState("");
   const [fileLabel, setFileLabel] = useState("");
   const [preset, setPreset] = useState<Preset>("douyin_both_corners");
   const [repairMode, setRepairMode] = useState<RepairMode>("opencv");
   const [removeSubtitle, setRemoveSubtitle] = useState(false);
+  const [autoDetect, setAutoDetect] = useState(false);
+  // Some clips change watermark layout mid-video (corner overlay, then a
+  // centred end card). This adds a second region for the tail of the video.
+  const [endCardWatermark, setEndCardWatermark] = useState(false);
+  const [mediaSize, setMediaSize] = useState<{ width: number; height: number } | null>(null);
+  // When the end-card watermark starts. Seeded from the clip duration as a
+  // starting guess, but an estimate can be wrong, so the user must confirm it
+  // before a two-phase repair is submitted.
+  const [splitSeconds, setSplitSeconds] = useState("");
+  const [splitConfirmed, setSplitConfirmed] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
@@ -31,8 +107,28 @@ export default function WatermarkPage() {
         mediaType: ["image", "video"],
         sourceType: ["album", "camera"]
       });
-      const file = res.tempFiles[0] as { tempFilePath: string; size?: number; fileType?: string };
+      const file = res.tempFiles[0] as {
+        tempFilePath: string; size?: number; fileType?: string;
+        width?: number; height?: number; duration?: number;
+      };
       setFilePath(file.tempFilePath);
+      // Regions are computed from the real frame size: a mask calibrated for one
+      // resolution lands outside the frame on another and silently repairs
+      // nothing.
+      if (file.width && file.height) {
+        setMediaSize({ width: file.width, height: file.height });
+      } else {
+        setMediaSize(null);
+      }
+      // Seed the end-card split from the clip's own duration so a short video
+      // does not keep its whole length in the content phase. The user can still
+      // override it.
+      if (file.duration && file.duration > 0) {
+        setSplitSeconds(String(Math.round(file.duration * 0.8)));
+      } else {
+        setSplitSeconds("");
+      }
+      setSplitConfirmed(false);
       const sizeMb = file.size ? `${(file.size / 1024 / 1024).toFixed(2)} MB` : "已选择";
       setFileLabel(`${file.fileType || "素材"} · ${sizeMb}`);
     } catch (err) {
@@ -68,6 +164,14 @@ export default function WatermarkPage() {
       Taro.showToast({ title: "请先确认素材授权", icon: "none" });
       return;
     }
+    if (endCardWatermark && !splitConfirmed) {
+      Taro.showToast({ title: "请确认片尾开始时间", icon: "none" });
+      return;
+    }
+    if (endCardWatermark && !(Number(splitSeconds) > 0)) {
+      Taro.showToast({ title: "请填写有效的片尾开始时间", icon: "none" });
+      return;
+    }
     setSubmitting(true);
     try {
       Taro.showLoading({ title: "上传中..." });
@@ -75,7 +179,11 @@ export default function WatermarkPage() {
         mask_preset: preset,
         repair_mode: repairMode,
         remove_subtitle: removeSubtitle,
-        confirm_authorized: confirmed
+        auto_detect: autoDetect,
+        confirm_authorized: confirmed,
+        timed_mask_regions: endCardWatermark
+          ? buildTimedRegions(preset, mediaSize, Number(splitSeconds) || 12)
+          : []
       });
       Taro.hideLoading();
       Taro.showToast({ title: "任务已创建", icon: "success" });
@@ -139,10 +247,51 @@ export default function WatermarkPage() {
             >
               <View className='mode-icon'>AI</View>
               <View className='mode-name'>AI 修复</View>
-              <View className='mode-desc'>IOPaint 可用时启用</View>
+              <View className='mode-desc'>IOPaint LaMa 真实推理</View>
             </View>
           </View>
         </View>
+
+        <View className='toggle-row' onClick={() => setAutoDetect(!autoDetect)}>
+          <Text className={`checkbox ${autoDetect ? "checked" : ""}`}>{autoDetect ? "✓" : ""}</Text>
+          <View>
+            <View className='feature-title'>自动检测水印区域</View>
+            <View className='muted'>开启后忽略上方预设，由系统定位水印；检测不到会直接失败</View>
+          </View>
+        </View>
+
+        <View className='toggle-row' onClick={() => { setEndCardWatermark(!endCardWatermark); setSplitConfirmed(false); }}>
+          <Text className={`checkbox ${endCardWatermark ? "checked" : ""}`}>{endCardWatermark ? "✓" : ""}</Text>
+          <View>
+            <View className='feature-title'>片尾也有水印</View>
+            <View className='muted'>视频末尾出现居中片尾水印时开启，将按时间段分别处理</View>
+          </View>
+        </View>
+
+        {endCardWatermark && (
+          <View className='toggle-row'>
+            <View>
+              <View className='feature-title'>片尾开始时间（秒）</View>
+              <View className='muted'>
+                已按视频时长预估 {splitSeconds || "?"} 秒。请核对实际转场时刻并修改，然后勾选确认。
+              </View>
+              <Input
+                className='split-input'
+                type='number'
+                value={splitSeconds}
+                onInput={(e) => { setSplitSeconds(e.detail.value); setSplitConfirmed(false); }}
+                placeholder='例如 12'
+              />
+              <View className='toggle-row' onClick={() => setSplitConfirmed(!splitConfirmed)}>
+                <Text className={`checkbox ${splitConfirmed ? "checked" : ""}`}>{splitConfirmed ? "✓" : ""}</Text>
+                <View>
+                  <View className='feature-title'>确认该时间正确</View>
+                  <View className='muted'>预估时间可能偏差；未确认将无法提交，避免漏修水印</View>
+                </View>
+              </View>
+            </View>
+          </View>
+        )}
 
         <View className='toggle-row' onClick={() => setRemoveSubtitle(!removeSubtitle)}>
           <Text className={`checkbox ${removeSubtitle ? "checked" : ""}`}>{removeSubtitle ? "✓" : ""}</Text>

@@ -2,13 +2,24 @@ from __future__ import annotations
 
 import os
 import shutil
+from pathlib import Path
 
 import pytest
 
-os.environ["GREENVIDEO_DATABASE_URL"] = "sqlite:///./storage/test_greenvideo.db"
-os.environ["GREENVIDEO_STORAGE_DIR"] = "./storage"
+# The tests must never share storage with a running server. An earlier version
+# pointed GREENVIDEO_STORAGE_DIR at the live "./storage" and then rmtree'd its
+# uploads directory, which deleted real user uploads and finished task outputs
+# every time pytest ran.
+TEST_ROOT = Path(__file__).resolve().parent / "_test_storage"
 
-from app.db import database_path, engine
+# Four slashes: "sqlite:///" + an absolute POSIX path.
+os.environ["GREENVIDEO_DATABASE_URL"] = (
+    f"sqlite:///{(TEST_ROOT / 'test_greenvideo.db').as_posix()}"
+)
+os.environ["GREENVIDEO_STORAGE_DIR"] = str(TEST_ROOT)
+os.environ["GREENVIDEO_IOPAINT_ENABLED"] = "false"
+
+from app.db import database_path, engine  # noqa: E402
 
 db_file = database_path()
 if db_file.exists():
@@ -18,20 +29,8 @@ if db_file.exists():
 
 @pytest.fixture(scope="session", autouse=True)
 def setup_test_database():
+    TEST_ROOT.mkdir(parents=True, exist_ok=True)
     yield
     engine.dispose()
-    if db_file.exists():
-        try:
-            db_file.unlink()
-        except OSError:
-            pass
-    test_files = os.path.join("storage", "files")
-    if os.path.isdir(test_files):
-        for name in os.listdir(test_files):
-            if name.startswith(("task_", "new_file_id")):
-                path = os.path.join(test_files, name)
-                if os.path.isfile(path):
-                    os.remove(path)
-    test_uploads = os.path.join("storage", "uploads")
-    if os.path.isdir(test_uploads):
-        shutil.rmtree(test_uploads, ignore_errors=True)
+    # Only the isolated test tree is removed, never the live storage directory.
+    shutil.rmtree(TEST_ROOT, ignore_errors=True)

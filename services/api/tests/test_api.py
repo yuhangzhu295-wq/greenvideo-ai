@@ -39,7 +39,12 @@ def test_parse_demo_share_text() -> None:
     assert len(data["formats"]) == 3
 
 
-def test_download_task_completes_and_serves_file() -> None:
+def test_download_task_fails_instead_of_serving_demo_file() -> None:
+    """Real platform download is not implemented, so the task must not pretend.
+
+    The previous behaviour wrote a text file named .mp4 and marked the task
+    completed, which handed the user an unplayable file with a success status.
+    """
     parsed = client.post("/api/parse", json={"url": "https://example.com/demo"}).json()
     response = client.post(
         "/api/tasks/download",
@@ -48,11 +53,11 @@ def test_download_task_completes_and_serves_file() -> None:
     assert response.status_code == 200
     task_id = response.json()["task_id"]
     status = wait_for_task(task_id)
-    assert status["status"] == "completed"
-    assert status["download_url"] == f"/api/files/{task_id}"
-    file_response = client.get(status["download_url"])
-    assert file_response.status_code == 200
-    assert b"GreenVideo AI" in file_response.content
+    assert status["status"] == "failed"
+    assert status["download_url"] is None
+    assert status["error"]
+    file_response = client.get(f"/api/files/{task_id}")
+    assert file_response.status_code == 409
 
 
 def test_watermark_requires_authorization() -> None:
@@ -62,10 +67,13 @@ def test_watermark_requires_authorization() -> None:
 
 
 def test_watermark_json_task_completes() -> None:
+    # The payload must reference a real uploaded file. A source_task_id that
+    # does not resolve to media used to fall through to a demo text file that
+    # was reported as a successful repair.
     response = client.post(
         "/api/tasks/watermark",
         json={
-            "source_task_id": "task_demo",
+            "source_task_id": "task_missing",
             "mask_preset": "douyin_both_corners",
             "repair_mode": "opencv",
             "remove_subtitle": False,
@@ -75,15 +83,38 @@ def test_watermark_json_task_completes() -> None:
     assert response.status_code == 200
     task_id = response.json()["task_id"]
     status = wait_for_task(task_id)
-    assert status["status"] == "completed"
-    assert status["download_url"] == f"/api/files/{task_id}"
+    assert status["status"] == "failed"
+    assert status["download_url"] is None
+    assert status["error"]
+
+
+def test_watermark_unresolvable_source_fails() -> None:
+    """A task without usable media must never be reported as completed."""
+    response = client.post(
+        "/api/tasks/watermark",
+        json={"video_url": "https://example.com/missing.mp4", "confirm_authorized": True},
+    )
+    task_id = response.json()["task_id"]
+    status = wait_for_task(task_id)
+    assert status["status"] == "failed"
+    assert "素材" in (status["stage"] or "")
 
 
 def test_watermark_multipart_upload() -> None:
-    png = (
-        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-        b"\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\rIDATx\x9cc`\x00\x00\x00"
-        b"\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82"
+    # Valid PNG fixture (120x80 with a bright block in the top-left watermark area).
+    # The previous inline fixture was a corrupt 65-byte PNG that no decoder can read,
+    # which made the task silently copy the input and report success.
+    import base64
+
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAHgAAABQCAIAAABd+SbeAAABZElEQVR4Ae3BsREAMAwCMZjc"
+        "783TZgEK3yEZUOUZUOUZUOUZUOUZUOUZ0GdmdMHu6hQD+syMLthdnWJAn5nRBburUwzoMzO6"
+        "YHd1igF9ZkYX7K5OMaDPzOiC3dUpBvSZGV2wuzrFgD4zowt2V6cY0GdmdMHu6hQD+syMLthd"
+        "nWJAn5nRBburUwzoMzO6YHd1igF9ZkYX7K5OMaDPzOiC3dUpBvSZGV2wuzrFgD4zowt2V6cY"
+        "UOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZ"
+        "UOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZ"
+        "UOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZUOUZ"
+        "UOUZUOUZUOUZUOUZUOU9K4moUSeXQOoAAAAASUVORK5CYII="
     )
     response = client.post(
         "/api/tasks/watermark",

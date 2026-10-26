@@ -51,6 +51,22 @@ class MaskRegion(BaseModel):
     h: int = Field(gt=0)
 
 
+class TimedMaskRegion(BaseModel):
+    """A mask region that only applies to part of the video.
+
+    Watermarks often change layout mid-clip (a corner overlay during the content,
+    a centred end card at the tail). Without a time scope a single static mask
+    either misses the second layout or masks frames where nothing is there.
+    """
+
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+    w: int = Field(gt=0)
+    h: int = Field(gt=0)
+    start_s: float = Field(default=0.0, ge=0)
+    end_s: float | None = Field(default=None, gt=0)
+
+
 MaskPreset = Literal[
     "douyin_top_left",
     "douyin_bottom_right",
@@ -65,11 +81,13 @@ class WatermarkTaskRequest(BaseModel):
     parse_id: str | None = Field(default=None, max_length=120)
     video_url: str | None = Field(default=None, max_length=4000)
     mask_regions: list[MaskRegion] = Field(default_factory=list)
+    timed_mask_regions: list[TimedMaskRegion] = Field(default_factory=list)
     mask_preset: MaskPreset = "douyin_both_corners"
     repair_mode: RepairMode = "opencv"
     remove_subtitle: bool = False
     confirm_authorized: bool = False
     mode: Literal["standard", "ai"] | None = None
+    auto_detect: bool = False
 
     @model_validator(mode="after")
     def normalize_legacy_mode(self) -> WatermarkTaskRequest:

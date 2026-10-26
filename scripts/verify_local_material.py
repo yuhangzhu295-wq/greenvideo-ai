@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 
 BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
 LOCAL_MATERIAL = Path(r"C:\Users\zyu33\Desktop\f553635d2972ffa3bca4b94d7ad10b42.mp4")
+PROJECT_MATERIAL = Path(__file__).resolve().parent / "fixtures" / "smoke_watermark.mp4"
 ARTIFACTS = Path("artifacts")
 
 
@@ -58,6 +59,8 @@ def make_demo_video(path: Path) -> tuple[Path, bool, str]:
 def ensure_material() -> tuple[Path, bool, str]:
     if LOCAL_MATERIAL.exists():
         return LOCAL_MATERIAL, False, "使用用户提供的本地素材。"
+    if PROJECT_MATERIAL.exists():
+        return PROJECT_MATERIAL, True, "本地 Desktop 素材不存在，已改用仓库内置测试素材（含可见水印）。"
     return make_demo_video(ARTIFACTS / "demo_watermarked.mp4")
 
 
@@ -140,6 +143,41 @@ def extract_frames(input_path: Path, output_path: Path, last: bool = False) -> b
     return result.returncode == 0 and output_path.exists()
 
 
+def mask_region_delta(before_path: Path, after_path: Path) -> dict[str, float] | None:
+    """Mean absolute pixel delta inside each watermark mask region.
+
+    A real repair must change the masked area; a copied file yields ~0.0.
+    """
+    if not (before_path.exists() and after_path.exists()):
+        return None
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return None
+
+    before = cv2.imread(str(before_path))
+    after = cv2.imread(str(after_path))
+    if before is None or after is None or before.shape != after.shape:
+        return None
+    height, width = before.shape[:2]
+    regions = {
+        "topleft": (0, 0, int(width * 0.42), int(height * 0.18)),
+        "bottomright": (int(width * 0.60), int(height * 0.78), int(width * 0.40), int(height * 0.18)),
+    }
+    deltas: dict[str, float] = {}
+    for name, (x, y, w, h) in regions.items():
+        x2, y2 = min(width, x + w), min(height, y + h)
+        if x2 <= x or y2 <= y:
+            continue
+        delta = np.abs(before[y:y2, x:x2].astype(int) - after[y:y2, x:x2].astype(int))
+        deltas[name] = round(float(delta.mean()), 3)
+    deltas["whole_frame"] = round(
+        float(np.abs(before.astype(int) - after.astype(int)).mean()), 3
+    )
+    return deltas
+
+
 def main() -> None:
     ARTIFACTS.mkdir(exist_ok=True)
     source, used_demo, material_note = ensure_material()
@@ -176,6 +214,25 @@ def main() -> None:
     before_last = extract_frames(source, ARTIFACTS / "watermark_before_last.jpg", last=True)
     after_last = extract_frames(output, ARTIFACTS / "watermark_after_last.jpg", last=True)
 
+    delta_first = mask_region_delta(
+        ARTIFACTS / "watermark_before_001.jpg", ARTIFACTS / "watermark_after_001.jpg"
+    )
+    delta_last = mask_region_delta(
+        ARTIFACTS / "watermark_before_last.jpg", ARTIFACTS / "watermark_after_last.jpg"
+    )
+    # A genuine repair must move pixels inside at least one watermark mask region.
+    repair_happened = any(
+        delta and max(
+            value for key, value in delta.items() if key != "whole_frame"
+        ) > 1.0
+        for delta in (delta_first, delta_last)
+    )
+
+    def render_delta(delta: dict[str, float] | None) -> str:
+        if not delta:
+            return "`unavailable`"
+        return ", ".join(f"{key}=`{value}`" for key, value in delta.items())
+
     report = ARTIFACTS / "watermark_validation_report.md"
     report.write_text(
         "\n".join(
@@ -196,6 +253,9 @@ def main() -> None:
                 f"- Extracted after first frame: `{after_001}`",
                 f"- Extracted before last frame: `{before_last}`",
                 f"- Extracted after last frame: `{after_last}`",
+                f"- Mask region delta (first frame): {render_delta(delta_first)}",
+                f"- Mask region delta (last frame): {render_delta(delta_last)}",
+                f"- Repair actually changed masked pixels: `{repair_happened}`",
             ]
         )
         + "\n",
@@ -204,6 +264,10 @@ def main() -> None:
     print(report.read_text(encoding="utf-8"))
     if not output.exists() or output.stat().st_size == 0 or not duration_ok:
         raise SystemExit("Local material verification failed.")
+    if not repair_happened:
+        raise SystemExit(
+            "Mask regions were not modified: the output is not a real watermark repair."
+        )
 
 
 if __name__ == "__main__":

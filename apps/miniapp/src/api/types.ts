@@ -30,10 +30,16 @@ export interface WatermarkPayload {
   parse_id?: string;
   video_url?: string;
   mask_regions?: Array<{ x: number; y: number; w: number; h: number }>;
+  /** Time-scoped regions for clips whose watermark changes layout mid-video. */
+  timed_mask_regions?: Array<{
+    x: number; y: number; w: number; h: number;
+    start_s: number; end_s?: number;
+  }>;
   mask_preset?: "douyin_top_left" | "douyin_bottom_right" | "douyin_both_corners" | "custom";
   repair_mode?: "opencv" | "ai";
   remove_subtitle?: boolean;
   confirm_authorized?: boolean;
+  auto_detect?: boolean;
 }
 
 export interface TaskStatus {

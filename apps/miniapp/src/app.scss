@@ -1552,3 +1552,14 @@ button::after {
     flex-direction: column;
   }
 }
+
+.split-input {
+  margin-top: 12px;
+  padding: 10px 14px;
+  border: 1px solid rgba(15, 118, 110, 0.25);
+  border-radius: 10px;
+  background: #fff;
+  font-size: 26px;
+  color: #0f172a;
+  width: 200px;
+}

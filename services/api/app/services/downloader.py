@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +40,19 @@ PROTECTED_ERROR_MARKERS = (
     "登录",
 )
 DRM_ERROR_MARKERS = ("drm", "widevine", "copyright", "版权")
+NETWORK_ERROR_MARKERS = (
+    "ssl",
+    "eof occurred",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "timed out",
+    "timeout",
+    "temporary failure in name resolution",
+    "getaddrinfo",
+    "network is unreachable",
+    "remote end closed connection",
+)
 RATE_LIMIT_MARKERS = (
     "rate limit",
     "too many requests",
@@ -110,8 +124,18 @@ class VideoDownloader:
         return new_id("task")
 
     def _find_ytdlp(self) -> str | None:
-        exe_dir = str(Path(sys.executable).parent)
-        return shutil.which("yt-dlp") or shutil.which("yt-dlp", path=exe_dir)
+        """Prefer the interpreter-local yt-dlp over whatever is on PATH.
+
+        An older global install on PATH shadowed the pinned version and hit a
+        Cloudflare anti-bot challenge, which surfaced as a generic "parse
+        failed" even though the project's own dependency worked.
+        """
+        exe_dir = Path(sys.executable).parent
+        for candidate in ("yt-dlp.exe", "yt-dlp"):
+            local = exe_dir / candidate
+            if local.exists():
+                return str(local)
+        return shutil.which("yt-dlp")
 
     def _classify_failure(self, text: str, url: str) -> DownloadError:
         lower = text.lower()
@@ -126,6 +150,14 @@ class VideoDownloader:
             return DownloadError(
                 "PRIVATE_VIDEO_NOT_SUPPORTED",
                 "该视频为私密或不可公开视频，无法解析。",
+            )
+        # Checked before the platform-block markers: a TLS/connection failure is
+        # not a platform restriction, and telling the user to "try later" is
+        # more useful than implying their link is unsupported.
+        if any(marker in lower for marker in NETWORK_ERROR_MARKERS):
+            return DownloadError(
+                "NETWORK_ERROR",
+                "访问视频源时网络连接中断或被重置，请重试；若持续失败，可上传本地授权素材处理。",
             )
         if any(marker in lower for marker in RATE_LIMIT_MARKERS):
             return DownloadError(
@@ -175,6 +207,12 @@ class VideoDownloader:
         )
 
     def _select_formats(self, formats: list[dict]) -> list[FormatDTO]:
+        """Describe the formats that actually exist.
+
+        Missing metadata is reported as unknown (size 0.0, generic label) rather
+        than filled in with a plausible-looking number: a fabricated size would
+        tell the user something about the file that nobody measured.
+        """
         mp4_formats = [
             fmt
             for fmt in formats
@@ -186,34 +224,49 @@ class VideoDownloader:
             if fmt.get("acodec") not in {None, "none"} and fmt.get("vcodec") in {None, "none"}
         ]
 
-        high = max(mp4_formats, key=lambda item: item.get("height") or 0, default={})
-        low = min(mp4_formats, key=lambda item: item.get("height") or 9999, default={})
-        audio = audio_formats[0] if audio_formats else {}
-
-        def size_mb(item: dict, fallback: float) -> float:
+        def size_mb(item: dict) -> float:
             byte_size = item.get("filesize") or item.get("filesize_approx")
-            return round(byte_size / 1024 / 1024, 2) if byte_size else fallback
+            return round(byte_size / 1024 / 1024, 2) if byte_size else 0.0
 
-        return [
-            FormatDTO(
-                format_id=str(high.get("format_id") or "1080p"),
-                label="高清视频 1080P",
-                ext="mp4",
-                size_mb=size_mb(high, 52.36),
-            ),
-            FormatDTO(
-                format_id=str(low.get("format_id") or "720p"),
-                label="高清视频 720P",
-                ext="mp4",
-                size_mb=size_mb(low, 23.14),
-            ),
-            FormatDTO(
-                format_id=str(audio.get("format_id") or "mp3"),
-                label="音频文件 MP3",
-                ext="mp3",
-                size_mb=size_mb(audio, 4.85),
-            ),
-        ]
+        selected: list[FormatDTO] = []
+        if mp4_formats:
+            heights = sorted(
+                {(fmt.get("height") or 0) for fmt in mp4_formats}, reverse=True
+            )
+            for height in heights[:2]:
+                item = next(
+                    fmt for fmt in mp4_formats if (fmt.get("height") or 0) == height
+                )
+                selected.append(
+                    FormatDTO(
+                        format_id=str(item.get("format_id") or f"{height}p"),
+                        label=f"视频 {height}P" if height else "视频 原始画质",
+                        ext="mp4",
+                        size_mb=size_mb(item),
+                    )
+                )
+        else:
+            # A direct media URL exposes no per-format metadata, so offer one
+            # honest option instead of inventing two resolutions.
+            selected.append(
+                FormatDTO(format_id="best", label="原始文件", ext="mp4", size_mb=0.0)
+            )
+
+        if audio_formats:
+            audio = audio_formats[0]
+            selected.append(
+                FormatDTO(
+                    format_id=str(audio.get("format_id") or "mp3"),
+                    label="音频文件 MP3",
+                    ext="mp3",
+                    size_mb=size_mb(audio),
+                )
+            )
+        else:
+            selected.append(
+                FormatDTO(format_id="mp3", label="音频文件 MP3", ext="mp3", size_mb=0.0)
+            )
+        return selected
 
     def _demo_result(self, url: str) -> ParseResultDTO:
         digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
@@ -230,3 +283,115 @@ class VideoDownloader:
                 FormatDTO(format_id="mp3", label="音频文件 MP3", ext="mp3", size_mb=4.85),
             ],
         )
+
+    def build_selector(self, format_id: str) -> tuple[str, bool]:
+        """Map a client format id to a yt-dlp format selector.
+
+        Returns ``(selector, audio_only)``. A bare video format id from the
+        parse result is usually video-only, so pairing it with the best audio
+        track is what makes the downloaded file playable with sound.
+        """
+        fid = (format_id or "").strip()
+        if fid == "1080p":
+            return (
+                "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
+                "/best[height<=1080][ext=mp4]/best[height<=1080]/best",
+                False,
+            )
+        if fid == "720p":
+            return (
+                "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
+                "/best[height<=720][ext=mp4]/best[height<=720]/best",
+                False,
+            )
+        if fid == "mp3":
+            return ("bestaudio/best", True)
+        if not fid:
+            return ("best", False)
+        return (f"{fid}+bestaudio/{fid}/best", False)
+
+    def download(
+        self,
+        url: str,
+        format_id: str,
+        output_dir: Path,
+        progress_cb: Callable[[int, str], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> Path:
+        """Download one public video/audio and return the produced file.
+
+        Every failure is raised as a DownloadError with a business-safe code;
+        nothing is written to look like a finished download when it is not.
+        """
+        if not url:
+            raise DownloadError(
+                "PARSE_RESULT_EXPIRED",
+                "解析结果没有记录来源链接（可能是旧版本解析的），请重新解析后再下载。",
+            )
+        public_url = validate_public_http_url(url)
+        yt_dlp_path = self._find_ytdlp()
+        if not yt_dlp_path:
+            raise DownloadError(
+                "PLATFORM_BLOCKED_OR_RATE_LIMITED",
+                "当前运行环境未找到 yt-dlp，无法执行真实下载。",
+            )
+
+        selector, audio_only = self.build_selector(format_id)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        template = str(output_dir / "download.%(ext)s")
+
+        cmd = [
+            yt_dlp_path,
+            "--no-playlist",
+            "--no-warnings",
+            "--no-progress",
+            "--newline",
+            "-f", selector,
+            "-o", template,
+        ]
+        if audio_only:
+            cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
+        else:
+            cmd += ["--merge-output-format", "mp4"]
+        cmd.append(public_url)
+
+        if progress_cb:
+            progress_cb(30, "开始下载")
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            shell=False,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=self.timeout_seconds * 20)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            raise DownloadError(
+                "DOWNLOAD_TIMEOUT",
+                f"下载超时（{self.timeout_seconds * 20} 秒），请稍后重试或改用本地上传。",
+            ) from None
+
+        if cancel_check is not None and cancel_check():
+            for produced in output_dir.glob("download.*"):
+                produced.unlink(missing_ok=True)
+            raise DownloadError("TASK_CANCELED", "任务已被用户取消。")
+
+        if process.returncode != 0:
+            raise self._classify_failure(f"{stderr}\n{stdout}", public_url)
+
+        produced = sorted(
+            output_dir.glob("download.*"), key=lambda p: p.stat().st_size, reverse=True
+        )
+        produced = [p for p in produced if p.stat().st_size > 0]
+        if not produced:
+            raise DownloadError(
+                "DOWNLOAD_FAILED",
+                "yt-dlp 报告成功但没有生成任何文件，未提供下载结果。",
+            )
+        if progress_cb:
+            progress_cb(85, "下载完成，校验文件")
+        return produced[0]
