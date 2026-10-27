@@ -53,7 +53,24 @@ def _audio_stream_status(path: Path) -> str:
     streams = probe.get("streams")
     if not isinstance(streams, list):
         return "unknown"
-    return "present" if any(s.get("codec_type") == "audio" for s in streams) else "absent"
+    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+    if not audio_streams:
+        return "absent"
+
+    # If the container declares an audio stream, verify that actual audio packets
+    # can be demuxed. A header-only file (e.g. mdat stripped) declares a stream
+    # but contains no packets, which must not be reported as "present".
+    try:
+        from app.services.video_repair import count_packets
+
+        pkts = count_packets(path, "audio")
+    except Exception:
+        return "unknown"
+    if pkts is None:
+        return "unknown"
+    if pkts <= 0:
+        return "absent"
+    return "present"
 
 
 def _has_audio_stream(path: Path) -> bool:
@@ -622,6 +639,19 @@ class WatermarkProcessor:
             shutil.copyfile(input_path, output_path)
             return output_path
 
+        # A truncated source keeps its original header, so the container still
+        # advertises the full frame count while the tail is gone. Repairing it
+        # would produce a short video and report success, so the source is
+        # checked against its own header before any work starts.
+        from app.services.video_repair import media_integrity_issues
+
+        source_issues = media_integrity_issues(input_path, "video")
+        if source_issues:
+            cap.release()
+            raise AiServiceError(
+                "输入视频不完整，未执行修复：" + "；".join(source_issues)
+            )
+
         mask = self._generate_mask((height, width), mask_regions, mask_preset, remove_subtitle)
 
         if repair_mode == "ai":
@@ -877,6 +907,13 @@ class WatermarkProcessor:
             raise AiServiceError(
                 f"输出文件只有 {out_packets} 帧（应为 {frame_count}），"
                 "已中止而非交付缺帧视频"
+            )
+        # The delivered file must also decode, and must match whatever its own
+        # header claims. A truncated encode otherwise looks complete.
+        out_issues = media_integrity_issues(output_path, "video")
+        if out_issues:
+            raise AiServiceError(
+                "输出视频不完整，已中止而非交付：" + "；".join(out_issues)
             )
 
         if repaired_frames == 0:

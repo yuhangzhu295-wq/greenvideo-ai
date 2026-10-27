@@ -109,6 +109,9 @@ def test_p0_1b_repair_video_checks_every_frame_write(tmp_path: Path, monkeypatch
     import app.services.video_repair as vr
 
     monkeypatch.setattr(vr, "iopaint_status", lambda: (True, "test"))
+    # The model handshake would otherwise require a live IOPaint process; this
+    # test is about the per-frame write guard, not about the AI service.
+    monkeypatch.setattr(vr, "_ensure_model", lambda *a, **kw: None)
 
     real_imwrite = cv2.imwrite
     seen = {"n": 0}
@@ -370,3 +373,41 @@ def test_p0_6_header_only_mp4_is_not_served(tmp_path: Path, monkeypatch) -> None
         files_router.get_file("task_header")
     assert exc.value.status_code == 409
     assert exc.value.detail["code"] in {"OUTPUT_EMPTY", "OUTPUT_NOT_PLAYABLE"}
+
+
+def test_p0_7_truncated_source_video_is_rejected_before_repair(tmp_path: Path) -> None:
+    """A source video whose packets are fewer than declared in its header must be rejected."""
+    import subprocess
+
+    import cv2
+
+    from app.schemas import MaskRegion
+    from app.services.watermark import WatermarkProcessor
+
+    frames = tmp_path / "_trunc_src_frames"
+    frames.mkdir()
+    for i in range(30):
+        cv2.imwrite(str(frames / f"f_{i:06d}.png"), np.full((96, 128, 3), 40 + i, dtype=np.uint8))
+    full = tmp_path / "full_src.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-framerate", "10", "-i", str(frames / "f_%06d.png"),
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(full)],
+        capture_output=True, check=True, timeout=300,
+    )
+    raw = full.read_bytes()
+    trunc = tmp_path / "trunc_src.mp4"
+    # Cut off 12% so some trailing packets are missing while moov header remains valid
+    trunc.write_bytes(raw[:int(len(raw) * 0.88)])
+
+    proc = WatermarkProcessor()
+    out = tmp_path / "out_should_not_exist.mp4"
+    with pytest.raises(AiServiceError) as exc:
+        proc.process_video(
+            input_path=trunc,
+            output_path=out,
+            mask_regions=[MaskRegion(x=10, y=10, w=50, h=20)],
+            mask_preset="custom",
+            repair_mode="opencv",
+            remove_subtitle=False,
+        )
+    assert "输入视频不完整" in str(exc.value)

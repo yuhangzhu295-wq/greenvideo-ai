@@ -60,34 +60,26 @@ def get_file(file_id: str) -> FileResponse:
         )
     if task.type in {"watermark", "download"}:
         # Audio-only downloads (mp3) legitimately have no video frames, so the
-        # playability check has to match the kind of file that was produced.
+        # completeness check has to match the kind of file that was produced.
+        # Both branches verify decodable data rather than the header alone: a
+        # track that only exists in the container index is not a playable file,
+        # and a truncated file keeps advertising its original frame count.
         audio_only = output_path.suffix.lower() in {".mp3", ".m4a", ".aac", ".wav", ".ogg"}
-        if audio_only:
-            from app.services.watermark import _audio_stream_status
+        kind = "audio" if audio_only else "video"
+        from app.services.video_repair import media_integrity_issues
 
-            if _audio_stream_status(output_path) != "present":
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "OUTPUT_NOT_PLAYABLE",
-                        "message": "输出文件没有可解码音轨，请重新执行处理任务。",
-                    },
-                )
-        else:
-            from app.services.video_repair import count_decoded_frames
-
-            try:
-                decoded = count_decoded_frames(output_path)
-            except Exception:
-                decoded = None
-            # A header-only MP4 has a video stream and zero frames: it is not
-            # playable, so it must not be handed back as a finished result.
-            if decoded is None or decoded <= 0:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "OUTPUT_NOT_PLAYABLE",
-                        "message": "输出文件没有可解码的视频帧，请重新执行处理任务。",
-                    },
-                )
+        try:
+            issues = media_integrity_issues(output_path, kind)
+        except Exception:
+            issues = ["无法校验输出文件完整性"]
+        if issues:
+            label = "音轨" if audio_only else "视频"
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "OUTPUT_NOT_PLAYABLE",
+                    "message": f"输出文件的{label}不完整，请重新执行处理任务："
+                    + "；".join(issues),
+                },
+            )
     return FileResponse(output_path, filename=output_path.name)

@@ -248,28 +248,39 @@ async def _run_download_task(task_id: str, payload: DownloadTaskRequest) -> None
             canceled,
         )
 
-        # The produced file must be real media, not a zero-byte or header-only
-        # artifact that merely exists on disk.
-        from app.services.video_repair import count_decoded_frames
+        # The produced file must be complete media, not a zero-byte, header-only
+        # or truncated artifact that merely exists on disk. Truncation matters
+        # here: a cut MP4 keeps its original header, so the advertised frame
+        # count is compared against the packets actually present.
+        from app.services.video_repair import media_integrity_issues
 
         ext = produced.suffix.lower()
-        if ext == ".mp3":
-            from app.services.watermark import _audio_stream_status
+        audio_only = ext in {".mp3", ".m4a", ".aac", ".wav", ".ogg"}
+        issues = media_integrity_issues(produced, "audio" if audio_only else "video")
+        if issues:
+            label = "音频" if audio_only else "视频"
+            raise DownloadError(
+                "DOWNLOAD_INCOMPLETE",
+                f"下载得到的{label}文件不完整，未提供下载结果：" + "；".join(issues),
+            )
 
-            if _audio_stream_status(produced) != "present":
-                raise DownloadError(
-                    "DOWNLOAD_FAILED", "下载得到的音频文件没有可解码音轨，未提供下载结果。"
-                )
-        else:
-            decoded = count_decoded_frames(produced)
-            if decoded is None or decoded <= 0:
-                raise DownloadError(
-                    "DOWNLOAD_FAILED", "下载得到的文件没有可解码视频帧，未提供下载结果。"
-                )
+        # Re-read the task before publishing: a cancel that arrived while the
+        # file was being verified must not be overwritten with "completed".
+        current = get_task(task_id)
+        if current is not None and current.status == "canceled":
+            shutil.rmtree(output_dir, ignore_errors=True)
+            return
 
         final = storage_path("files", output_name(task_id, ext.lstrip(".") or "mp4"))
         shutil.move(str(produced), str(final))
         shutil.rmtree(output_dir, ignore_errors=True)
+
+        # Second check after the move: the window between the first check and
+        # the status write is small but non-zero.
+        current = get_task(task_id)
+        if current is not None and current.status == "canceled":
+            _discard_output(final)
+            return
 
         update_task(
             task_id,

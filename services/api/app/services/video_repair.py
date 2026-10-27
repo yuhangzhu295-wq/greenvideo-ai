@@ -284,18 +284,21 @@ def count_packets(path: Path, stream_type: str = "video") -> int | None:
     return int(out)
 
 
-def count_decoded_frames(path: Path) -> int | None:
+def count_decoded_frames(path: Path, stream_type: str = "video") -> int | None:
     """Count frames the decoder can actually produce, or None if unobtainable.
 
     This is the strongest available statement about whether a file is playable:
     a header with no packets, or a truncated tail, shows up here as a shortfall.
+    Works for audio streams too (``stream_type="audio"``), which is how an
+    audio file that merely declares a track is told apart from one that carries
+    decodable audio.
     """
     try:
         result = subprocess.run(
             [
                 "ffprobe", "-v", "error",
                 "-count_frames",
-                "-select_streams", "v:0",
+                "-select_streams", f"{_ffprobe_stream_selector(stream_type)}:0",
                 "-show_entries", "stream=nb_read_frames",
                 "-of", "csv=p=0",
                 str(path),
@@ -313,6 +316,63 @@ def count_decoded_frames(path: Path) -> int | None:
     if not out.isdigit():
         return None
     return int(out)
+
+
+def declared_frame_count(path: Path, stream_type: str = "video") -> int | None:
+    """Frame count the container advertises, or None when it advertises none.
+
+    ``None`` means "unknown", not "zero": fragmented MP4s legitimately omit
+    this field, and treating an omission as a mismatch would reject valid files.
+    """
+    try:
+        probe = _ffprobe(path)
+    except Exception:
+        return None
+    for stream in probe.get("streams", []) or []:
+        if stream.get("codec_type") != stream_type:
+            continue
+        raw = stream.get("nb_frames")
+        if raw is not None and str(raw).isdigit():
+            return int(raw)
+    return None
+
+
+def media_integrity_issues(path: Path, kind: str = "video") -> list[str]:
+    """Reasons a produced file is not a complete, decodable piece of media.
+
+    An empty list means every check that could be performed passed. The checks
+    are based on demuxing and decoding, never on the header alone:
+
+      * at least one packet and one decodable frame must exist;
+      * the container must not advertise more frames than it actually holds —
+        a truncated file keeps its original header, so this is the only way to
+        notice the tail is missing.
+
+    The packet comparison is deliberately the strict one: an audio decoder can
+    legitimately report one frame fewer than the header (AAC priming), so
+    comparing decoded count against the declared count would reject healthy
+    files while catching nothing extra.
+
+    A count that cannot be obtained is reported as an issue, not a pass.
+    Counter edge: a file that is fragmented *and* truncated carries no header
+    count at all, so only decodability can be asserted for it.
+    """
+    issues: list[str] = []
+    packets = count_packets(path, kind)
+    decoded = count_decoded_frames(path, kind)
+    declared = declared_frame_count(path, kind)
+
+    if packets is None:
+        issues.append("无法统计实际数据包数")
+    elif packets <= 0:
+        issues.append("没有任何数据包")
+    if decoded is None:
+        issues.append("无法解码任何帧")
+    elif decoded <= 0:
+        issues.append("可解码帧数为 0")
+    if declared is not None and packets is not None and packets < declared:
+        issues.append(f"文件头声明 {declared} 帧但实际只有 {packets} 个数据包")
+    return issues
 
 
 def repair_video(
@@ -360,6 +420,13 @@ def repair_video(
     if width <= 0 or height <= 0:
         cap.release()
         raise AiServiceError("无法读取视频分辨率")
+
+    source_issues = media_integrity_issues(input_path, "video")
+    if source_issues:
+        cap.release()
+        raise AiServiceError(
+            "输入视频不完整，未执行修复：" + "；".join(source_issues)
+        )
 
     # Prefer the container's declared rate over OpenCV's average: for a
     # variable-rate source OpenCV reports something like 29.885, and encoding at
@@ -548,6 +615,12 @@ def repair_video(
         raise AiServiceError(
             f"从输入解码 {index} 帧但输入实际有 {src_packets} 帧，"
             "解码可能提前结束，已中止而非交付缺帧视频"
+        )
+
+    out_issues = media_integrity_issues(output_path, "video")
+    if out_issues:
+        raise AiServiceError(
+            "输出视频不完整，已中止而非交付：" + "；".join(out_issues)
         )
 
     report.notes.append(

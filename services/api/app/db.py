@@ -154,11 +154,11 @@ def insert_parse_result(row: dict) -> None:
         url_hash=row["url_hash"],
         url=row.get("url"),
         title=row["title"],
-        source=row["source"],
-        thumbnail=row["thumbnail"],
-        duration=row["duration"],
-        published_at=row["published_at"],
-        formats_json=json.dumps(row["formats"], ensure_ascii=False),
+        source=row.get("source", "公开视频"),
+        thumbnail=row.get("thumbnail", "/static/demo/thumb.svg"),
+        duration=int(row.get("duration", 0) or 0),
+        published_at=row.get("published_at", ""),
+        formats_json=json.dumps(row.get("formats", []), ensure_ascii=False),
         created_at=utc_now(),
     )
     with get_session() as session:

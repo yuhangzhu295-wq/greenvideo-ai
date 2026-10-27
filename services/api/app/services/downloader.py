@@ -112,9 +112,8 @@ class VideoDownloader:
         yt_dlp_path = self._find_ytdlp()
         if not yt_dlp_path:
             raise DownloadError(
-                "PLATFORM_BLOCKED_OR_RATE_LIMITED",
-                "当前运行环境未找到 yt-dlp，真实平台链接无法解析；"
-                "可先使用演示链接或上传本地授权素材继续体验。",
+                "YTDLP_UNAVAILABLE",
+                "当前运行环境未找到 yt-dlp，无法解析平台链接；请检查运行环境或上传本地授权素材。",
             )
         return self._parse_with_ytdlp(public_url, yt_dlp_path)
 
@@ -172,21 +171,32 @@ class VideoDownloader:
         return DownloadError("PARSE_FAILED", "公开视频解析失败，请检查链接是否可公开访问。")
 
     def _parse_with_ytdlp(self, url: str, executable_path: str) -> ParseResultDTO:
-        result = subprocess.run(
-            [
-                executable_path,
-                "--dump-json",
-                "--no-playlist",
-                "--skip-download",
-                "--no-warnings",
-                url,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=self.timeout_seconds,
-            check=False,
-            shell=False,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    executable_path,
+                    "--dump-json",
+                    "--no-playlist",
+                    "--skip-download",
+                    "--no-warnings",
+                    url,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+                check=False,
+                shell=False,
+            )
+        except subprocess.TimeoutExpired:
+            raise DownloadError(
+                "PARSE_TIMEOUT",
+                f"解析超时（{self.timeout_seconds} 秒），请稍后重试或改用本地上传。",
+            ) from None
+        except OSError as exc:
+            raise DownloadError(
+                "YTDLP_UNAVAILABLE",
+                f"无法启动 yt-dlp（{exc.__class__.__name__}），请检查运行环境。",
+            ) from exc
         if result.returncode != 0:
             raise self._classify_failure(f"{result.stderr}\n{result.stdout}", url)
 
@@ -245,21 +255,23 @@ class VideoDownloader:
                         size_mb=size_mb(item),
                     )
                 )
-        else:
+        elif not audio_formats:
             # A direct media URL exposes no per-format metadata, so offer one
             # honest option instead of inventing two resolutions.
             selected.append(
                 FormatDTO(format_id="best", label="原始文件", ext="mp4", size_mb=0.0)
             )
 
+        # The audio option always uses the selector "mp3", never the raw yt-dlp
+        # audio format id: a raw id (e.g. "140") would be treated as a video
+        # selector later and the download would fail with "no video frames".
         if audio_formats:
-            audio = audio_formats[0]
             selected.append(
                 FormatDTO(
-                    format_id=str(audio.get("format_id") or "mp3"),
+                    format_id="mp3",
                     label="音频文件 MP3",
                     ext="mp3",
-                    size_mb=size_mb(audio),
+                    size_mb=size_mb(audio_formats[0]),
                 )
             )
         else:
@@ -292,6 +304,14 @@ class VideoDownloader:
         track is what makes the downloaded file playable with sound.
         """
         fid = (format_id or "").strip()
+        # The id arrives from the client and becomes part of yt-dlp's selector
+        # grammar. Restrict it to the characters real format ids use so an
+        # unexpected value cannot smuggle extra selector syntax (e.g. '+', '/', ',').
+        if len(fid) > 64 or any(not (ch.isalnum() or ch in "_.-") for ch in fid):
+            raise DownloadError(
+                "INVALID_FORMAT",
+                "下载格式参数无效，请重新解析视频后再选择格式。",
+            )
         if fid == "1080p":
             return (
                 "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
@@ -332,8 +352,8 @@ class VideoDownloader:
         yt_dlp_path = self._find_ytdlp()
         if not yt_dlp_path:
             raise DownloadError(
-                "PLATFORM_BLOCKED_OR_RATE_LIMITED",
-                "当前运行环境未找到 yt-dlp，无法执行真实下载。",
+                "YTDLP_UNAVAILABLE",
+                "当前运行环境未找到 yt-dlp，无法执行下载；请检查运行环境。",
             )
 
         selector, audio_only = self.build_selector(format_id)
@@ -358,13 +378,22 @@ class VideoDownloader:
         if progress_cb:
             progress_cb(30, "开始下载")
 
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            shell=False,
-        )
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                shell=False,
+            )
+        except OSError as exc:
+            # The executable can disappear between discovery and launch (a
+            # package upgrade mid-run). Surface a business code instead of a
+            # bare OSError reaching the task as an unclassified failure.
+            raise DownloadError(
+                "YTDLP_UNAVAILABLE",
+                f"无法启动 yt-dlp（{exc.__class__.__name__}），请检查运行环境。",
+            ) from exc
         try:
             stdout, stderr = process.communicate(timeout=self.timeout_seconds * 20)
         except subprocess.TimeoutExpired:

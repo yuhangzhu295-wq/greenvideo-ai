@@ -65,17 +65,37 @@ def video_server(tmp_path: Path):
         cv2.imwrite(str(frames / f"f_{i:06d}.png"), img)
     clip = media / "clip.mp4"
     subprocess.run(
-        ["ffmpeg", "-y", "-framerate", "10", "-i", str(frames / "f_%06d.png"),
-         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=1.2",
-         "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264", "-pix_fmt", "yuv420p",
-         "-c:a", "aac", "-shortest", str(clip)],
-        capture_output=True, check=True, timeout=300,
+        [
+            "ffmpeg",
+            "-y",
+            "-framerate",
+            "10",
+            "-i",
+            str(frames / "f_%06d.png"),
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100:duration=1.2",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(clip),
+        ],
+        capture_output=True,
+        check=True,
+        timeout=300,
     )
 
     port = _free_port()
-    handler = functools.partial(
-        http.server.SimpleHTTPRequestHandler, directory=str(media)
-    )
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(media))
 
     class Quiet(handler.func):  # type: ignore[misc]
         def log_message(self, *args):  # noqa: D401 - silence test server
@@ -97,9 +117,7 @@ def video_server(tmp_path: Path):
 @pytest.fixture()
 def allow_localhost(monkeypatch):
     """Let the downloader reach the local test server without weakening prod."""
-    monkeypatch.setattr(
-        downloader_module, "validate_public_http_url", lambda url: url
-    )
+    monkeypatch.setattr(downloader_module, "validate_public_http_url", lambda url: url)
 
 
 def test_download_produces_playable_file(video_server, allow_localhost, tmp_path):
@@ -158,18 +176,54 @@ def test_formats_use_real_metadata_when_present():
     d = VideoDownloader()
     formats = d._select_formats(
         [
-            {"format_id": "137", "ext": "mp4", "vcodec": "avc1", "height": 1080,
-             "filesize": 104857600},
-            {"format_id": "136", "ext": "mp4", "vcodec": "avc1", "height": 720,
-             "filesize": 52428800},
-            {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "aac",
-             "filesize": 4194304},
+            {
+                "format_id": "137",
+                "ext": "mp4",
+                "vcodec": "avc1",
+                "height": 1080,
+                "filesize": 104857600,
+            },
+            {
+                "format_id": "136",
+                "ext": "mp4",
+                "vcodec": "avc1",
+                "height": 720,
+                "filesize": 52428800,
+            },
+            {
+                "format_id": "140",
+                "ext": "m4a",
+                "vcodec": "none",
+                "acodec": "aac",
+                "filesize": 4194304,
+            },
         ]
     )
     ids = [f.format_id for f in formats]
-    assert ids == ["137", "136", "140"]
+    # Video options keep their real yt-dlp ids. The audio option must NOT: a raw
+    # audio id would later be read as a video selector and the download would
+    # fail. It is always the stable "mp3" selector.
+    assert ids == ["137", "136", "mp3"]
     assert formats[0].size_mb == 100.0
     assert formats[2].ext == "mp3"
+    assert d.build_selector(formats[2].format_id) == ("bestaudio/best", True)
+
+
+def test_audio_only_source_offers_only_audio():
+    d = VideoDownloader()
+    formats = d._select_formats(
+        [{"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "aac"}]
+    )
+    assert [f.format_id for f in formats] == ["mp3"]
+    assert formats[0].ext == "mp3"
+
+
+def test_build_selector_rejects_unexpected_format_id():
+    d = VideoDownloader()
+    for hostile in ("137+bestaudio", "a b", "--exec=calc", "x" * 80, "a;b"):
+        with pytest.raises(DownloadError) as exc:
+            d.build_selector(hostile)
+        assert exc.value.code == "INVALID_FORMAT"
 
 
 def test_find_ytdlp_prefers_interpreter_local():
@@ -231,9 +285,22 @@ def test_task_wiring_moves_file_and_marks_completed(monkeypatch, tmp_path):
             np.full((96, 128, 3), 40 + i * 5, dtype=np.uint8),
         )
     subprocess.run(
-        ["ffmpeg", "-y", "-framerate", "10", "-i", str(frames / "f_%06d.png"),
-         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)],
-        capture_output=True, check=True, timeout=300,
+        [
+            "ffmpeg",
+            "-y",
+            "-framerate",
+            "10",
+            "-i",
+            str(frames / "f_%06d.png"),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(src),
+        ],
+        capture_output=True,
+        check=True,
+        timeout=300,
     )
 
     def fake_download(self, url, format_id, output_dir, progress_cb=None, cancel_check=None):
@@ -271,16 +338,27 @@ def test_task_wiring_fails_when_downloader_raises(monkeypatch):
     pid = "parse_wiring_fail"
     insert_parse_result(
         {
-            "id": pid, "url_hash": "wiringfail", "url": "https://example.invalid/x.mp4",
-            "title": "x", "source": "test", "thumbnail": "", "duration": 1,
+            "id": pid,
+            "url_hash": "wiringfail",
+            "url": "https://example.invalid/x.mp4",
+            "title": "x",
+            "source": "test",
+            "thumbnail": "",
+            "duration": 1,
             "published_at": "2024-01-01 00:00",
             "formats": [{"format_id": "best", "label": "原始文件", "ext": "mp4", "size_mb": 0.0}],
         }
     )
     tid = "task_wiring_fail"
     insert_task(
-        {"id": tid, "type": "download", "status": "queued", "progress": 0,
-         "stage": "等待下载", "input": {"parse_id": pid, "format_id": "best"}}
+        {
+            "id": tid,
+            "type": "download",
+            "status": "queued",
+            "progress": 0,
+            "stage": "等待下载",
+            "input": {"parse_id": pid, "format_id": "best"},
+        }
     )
 
     def boom(self, *a, **kw):
@@ -306,9 +384,15 @@ def test_parse_row_without_url_is_rejected():
     pid = "parse_no_url"
     insert_parse_result(
         {
-            "id": pid, "url_hash": "nourl", "url": None,
-            "title": "legacy", "source": "test", "thumbnail": "", "duration": 0,
-            "published_at": "2024-01-01 00:00", "formats": [],
+            "id": pid,
+            "url_hash": "nourl",
+            "url": None,
+            "title": "legacy",
+            "source": "test",
+            "thumbnail": "",
+            "duration": 0,
+            "published_at": "2024-01-01 00:00",
+            "formats": [],
         }
     )
     row = get_parse_result(pid)
@@ -323,9 +407,20 @@ def test_parse_row_without_url_is_rejected():
 def _make_audio(tmp_path: Path) -> Path:
     mp3 = tmp_path / "audio.mp3"
     subprocess.run(
-        ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=1",
-         "-c:a", "libmp3lame", str(mp3)],
-        capture_output=True, check=True, timeout=300,
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100:duration=1",
+            "-c:a",
+            "libmp3lame",
+            str(mp3),
+        ],
+        capture_output=True,
+        check=True,
+        timeout=300,
     )
     return mp3
 
@@ -351,8 +446,7 @@ def test_file_endpoint_serves_audio_only_output(tmp_path, monkeypatch):
             return self["type"]
 
     task = FakeTask(
-        {"id": "t_audio", "type": "download", "status": "completed",
-         "output_path": str(mp3)}
+        {"id": "t_audio", "type": "download", "status": "completed", "output_path": str(mp3)}
     )
     monkeypatch.setattr(files_router, "get_task", lambda _id: task)
     response = files_router.get_file("t_audio")
@@ -382,8 +476,7 @@ def test_file_endpoint_rejects_audio_output_without_track(tmp_path, monkeypatch)
             return self["type"]
 
     task = FakeTask(
-        {"id": "t_bad_audio", "type": "download", "status": "completed",
-         "output_path": str(bogus)}
+        {"id": "t_bad_audio", "type": "download", "status": "completed", "output_path": str(bogus)}
     )
     monkeypatch.setattr(files_router, "get_task", lambda _id: task)
     with pytest.raises(HTTPException) as exc:
@@ -413,3 +506,282 @@ def test_protected_content_is_refused():
     assert d._classify_failure("ERROR: HTTP Error 429 Too Many Requests", "https://x/y").code == (
         "PLATFORM_BLOCKED_OR_RATE_LIMITED"
     )
+
+
+def test_download_header_only_mp3_fails_honestly(monkeypatch, tmp_path):
+    """An mp3 download that produces only stream headers without audio packets must fail."""
+    import asyncio
+    import struct
+
+    from app.db import get_task, insert_parse_result, insert_task
+    from app.routers import tasks as tasks_module
+
+    # Create a container-based mp3/m4a without mdat
+    real_audio = _make_audio(tmp_path)
+    m4a = tmp_path / "real.m4a"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(real_audio),
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            str(m4a),
+        ],
+        capture_output=True,
+        check=True,
+        timeout=300,
+    )
+    raw = m4a.read_bytes()
+    out = bytearray()
+    i = 0
+    while i < len(raw):
+        if i + 8 > len(raw):
+            break
+        size = struct.unpack(">I", raw[i : i + 4])[0]
+        typ = raw[i + 4 : i + 8]
+        if size == 0:
+            size = len(raw) - i
+        if size == 1:
+            size = struct.unpack(">Q", raw[i + 8 : i + 16])[0]
+        if typ == b"mdat":
+            i += size
+            continue
+        out += raw[i : i + size]
+        i += size
+    fake_mp3 = tmp_path / "header_only.mp3"
+    fake_mp3.write_bytes(bytes(out))
+
+    pid = "parse_fake_mp3"
+    insert_parse_result(
+        {
+            "id": pid,
+            "url_hash": "fakemp3",
+            "url": "https://example.invalid/a.mp3",
+            "title": "fake",
+            "source": "test",
+            "thumbnail": "",
+            "duration": 1,
+            "published_at": "2024-01-01 00:00",
+            "formats": [{"format_id": "mp3", "label": "MP3", "ext": "mp3", "size_mb": 0.0}],
+        }
+    )
+    tid = "task_fake_mp3"
+    insert_task(
+        {
+            "id": tid,
+            "type": "download",
+            "status": "queued",
+            "progress": 0,
+            "stage": "等待下载",
+            "input": {"parse_id": pid, "format_id": "mp3"},
+        }
+    )
+
+    def fake_download(self, url, format_id, output_dir, progress_cb=None, cancel_check=None):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        dest = output_dir / "download.mp3"
+        dest.write_bytes(fake_mp3.read_bytes())
+        return dest
+
+    monkeypatch.setattr(VideoDownloader, "download", fake_download)
+
+    class Payload:
+        parse_id = pid
+        format_id = "mp3"
+
+    asyncio.run(tasks_module._run_download_task(tid, Payload()))
+    task = get_task(tid)
+    assert task.status == "failed"
+    assert "DOWNLOAD_INCOMPLETE" in (task.error or "")
+
+
+def test_download_truncated_video_fails_honestly(monkeypatch, tmp_path):
+    """A downloaded video that has fewer packets than declared must fail."""
+    import asyncio
+
+    from app.db import get_task, insert_parse_result, insert_task
+    from app.routers import tasks as tasks_module
+
+    # Create a faststart MP4, then cut off tail packets
+    frames = tmp_path / "_trunc_frames"
+    frames.mkdir()
+    import cv2
+    import numpy as np
+
+    for i in range(20):
+        cv2.imwrite(
+            str(frames / f"f_{i:06d}.png"),
+            np.full((96, 128, 3), 40 + i * 2, dtype=np.uint8),
+        )
+    full = tmp_path / "full.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-framerate",
+            "10",
+            "-i",
+            str(frames / "f_%06d.png"),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(full),
+        ],
+        capture_output=True,
+        check=True,
+        timeout=300,
+    )
+    raw = full.read_bytes()
+    trunc = tmp_path / "trunc.mp4"
+    trunc.write_bytes(raw[: int(len(raw) * 0.85)])
+
+    pid = "parse_trunc_dl"
+    insert_parse_result(
+        {
+            "id": pid,
+            "url_hash": "truncdl",
+            "url": "https://example.invalid/v.mp4",
+            "title": "trunc",
+            "source": "test",
+            "thumbnail": "",
+            "duration": 2,
+            "formats": [{"format_id": "best", "label": "MP4", "ext": "mp4", "size_mb": 0.0}],
+        }
+    )
+    tid = "task_trunc_dl"
+    insert_task(
+        {
+            "id": tid,
+            "type": "download",
+            "status": "queued",
+            "progress": 0,
+            "stage": "等待下载",
+            "input": {"parse_id": pid, "format_id": "best"},
+        }
+    )
+
+    def fake_download(self, url, format_id, output_dir, progress_cb=None, cancel_check=None):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        dest = output_dir / "download.mp4"
+        dest.write_bytes(trunc.read_bytes())
+        return dest
+
+    monkeypatch.setattr(VideoDownloader, "download", fake_download)
+
+    class Payload:
+        parse_id = pid
+        format_id = "best"
+
+    asyncio.run(tasks_module._run_download_task(tid, Payload()))
+    task = get_task(tid)
+    assert task.status == "failed"
+    assert "DOWNLOAD_INCOMPLETE" in (task.error or "")
+
+
+def test_download_cancel_race_preserves_canceled_status(monkeypatch, tmp_path):
+    """If user cancels right before task is updated to completed, it must remain canceled."""
+    import asyncio
+
+    from app.db import get_task, insert_parse_result, insert_task, update_task
+    from app.routers import tasks as tasks_module
+
+    # Produce a good file
+    src = tmp_path / "good.mp4"
+    frames = tmp_path / "_gf"
+    frames.mkdir()
+    import cv2
+    import numpy as np
+
+    for i in range(4):
+        cv2.imwrite(str(frames / f"f_{i:06d}.png"), np.full((96, 128, 3), 40, dtype=np.uint8))
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-framerate",
+            "10",
+            "-i",
+            str(frames / "f_%06d.png"),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(src),
+        ],
+        capture_output=True,
+        check=True,
+        timeout=300,
+    )
+
+    pid = "parse_cancel_race"
+    insert_parse_result(
+        {
+            "id": pid,
+            "url_hash": "crace",
+            "url": "https://example.invalid/v.mp4",
+            "title": "race",
+            "source": "test",
+            "thumbnail": "",
+            "duration": 1,
+            "formats": [{"format_id": "best", "label": "MP4", "ext": "mp4", "size_mb": 0.0}],
+        }
+    )
+    tid = "task_cancel_race"
+    insert_task(
+        {
+            "id": tid,
+            "type": "download",
+            "status": "queued",
+            "progress": 0,
+            "stage": "等待下载",
+            "input": {"parse_id": pid, "format_id": "best"},
+        }
+    )
+
+    def fake_download(self, url, format_id, output_dir, progress_cb=None, cancel_check=None):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        dest = output_dir / "download.mp4"
+        dest.write_bytes(src.read_bytes())
+        # Simulate user cancel during verification
+        update_task(tid, status="canceled")
+        return dest
+
+    monkeypatch.setattr(VideoDownloader, "download", fake_download)
+
+    class Payload:
+        parse_id = pid
+        format_id = "best"
+
+    asyncio.run(tasks_module._run_download_task(tid, Payload()))
+    task = get_task(tid)
+    assert task.status == "canceled"
+
+
+def test_ytdlp_process_errors_map_to_business_codes(monkeypatch):
+    """Timeout and OSError during execution must raise typed DownloadError."""
+    d = VideoDownloader()
+
+    # 1. Popen raises OSError
+    def bad_popen(*a, **kw):
+        raise FileNotFoundError("yt-dlp binary not found")
+
+    monkeypatch.setattr(subprocess, "Popen", bad_popen)
+    with pytest.raises(DownloadError) as exc:
+        d.download("https://example.invalid/v.mp4", "best", Path("unused"))
+    assert exc.value.code == "YTDLP_UNAVAILABLE"
+
+    # 2. subprocess.run in _parse_with_ytdlp raises TimeoutExpired
+    def timeout_run(*a, **kw):
+        raise subprocess.TimeoutExpired(cmd="yt-dlp", timeout=10)
+
+    monkeypatch.setattr(subprocess, "run", timeout_run)
+    with pytest.raises(DownloadError) as exc2:
+        d._parse_with_ytdlp("https://example.invalid/v.mp4", "yt-dlp")
+    assert exc2.value.code == "PARSE_TIMEOUT"
