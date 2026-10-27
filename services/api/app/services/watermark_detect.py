@@ -34,7 +34,10 @@ frame.
 
 from __future__ import annotations
 
+import json
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -46,6 +49,8 @@ class Detection:
     area: int
     score: float
     kind: str  # "text" | "logo" | "tracked"
+    start_s: float = 0.0
+    end_s: float | None = None
 
 
 @dataclass
@@ -57,6 +62,8 @@ class DetectionResult:
     per_frame_masks: list[np.ndarray] | None
     frame_count: int
     stats: dict
+    outro_cut_frame: int | None = None
+    outro_cut_s: float | None = None
 
 
 def _sample_frames(frames: list[np.ndarray], limit: int = 20) -> list[np.ndarray]:
@@ -72,10 +79,7 @@ def _temporal_median(sample: list[np.ndarray]) -> np.ndarray:
 
 
 def _staticness(sample: list[np.ndarray], median: np.ndarray) -> np.ndarray:
-    devs = [
-        np.abs(f.astype(np.float32) - median.astype(np.float32)).mean(axis=2)
-        for f in sample
-    ]
+    devs = [np.abs(f.astype(np.float32) - median.astype(np.float32)).mean(axis=2) for f in sample]
     maxdev = np.max(np.stack(devs, axis=0), axis=0)
     # A pixel that never changes is an overlay candidate; 40 grey levels is the
     # point where "moved" is considered certain.
@@ -186,8 +190,9 @@ def _overlap_ratio(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -
     return inter / smaller if smaller else 0.0
 
 
-def _expand(box: tuple[int, int, int, int], width: int, height: int,
-            margin_ratio: float = 0.1) -> tuple[int, int, int, int]:
+def _expand(
+    box: tuple[int, int, int, int], width: int, height: int, margin_ratio: float = 0.1
+) -> tuple[int, int, int, int]:
     """Grow a box by a fraction of its own size, clamped to the frame."""
     x, y, w, h = box
     mx = max(4, int(w * margin_ratio))
@@ -268,7 +273,7 @@ def _drop_scene_blobs(
     background, so both are dropped.
     """
     kept: list[tuple[int, int, int, int]] = []
-    for (x, y, w, h) in boxes:
+    for x, y, w, h in boxes:
         if w < 12 or h < 10:
             continue
         if w > width * 0.65 and h > height * 0.5:
@@ -279,9 +284,7 @@ def _drop_scene_blobs(
     return kept
 
 
-def _region_score(
-    score: np.ndarray, box: tuple[int, int, int, int]
-) -> float:
+def _region_score(score: np.ndarray, box: tuple[int, int, int, int]) -> float:
     x, y, w, h = box
     region = score[y : y + h, x : x + w]
     if region.size == 0:
@@ -415,7 +418,7 @@ def detect_watermarks(
                 if not tight:
                     cv2.rectangle(fmask, (x, y), (x + bw, y + bh), 255, -1)
                     continue
-                for (bx, by, bwd, bhd) in tight:
+                for bx, by, bwd, bhd in tight:
                     cv2.rectangle(
                         fmask,
                         (x1 + bx, y1 + by),
@@ -455,3 +458,192 @@ def detect_watermarks(
         len(frames),
         stats,
     )
+
+
+def detect_outro_cut(video_path: Path | str) -> tuple[int | None, float | None]:
+    """Detect if the video ends with a platform promo outro (e.g. Douyin outro).
+
+    Scans the last 4.5 seconds of the video for a sudden scene cut to a dark,
+    uniform border or promotional card lasting 1.5 to 4.2 seconds.
+    Returns (cut_frame_index, cut_seconds) or (None, None).
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total < 60:
+        cap.release()
+        return None, None
+
+    tail_frames = min(int(4.5 * fps), total // 2)
+    start_idx = total - tail_frames
+
+    prev_gray = None
+    records = []
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    for idx in range(start_idx, total):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        bmask = np.ones((height, width), dtype=bool)
+        bmask[int(height * 0.15) : int(height * 0.85), int(width * 0.15) : int(width * 0.85)] = (
+            False
+        )
+        luma = float(gray[bmask].mean())
+        std = float(gray[bmask].std())
+        diff = (
+            float(np.abs(gray.astype(float) - prev_gray.astype(float)).mean())
+            if prev_gray is not None
+            else 0.0
+        )
+        prev_gray = gray
+        records.append((idx, idx / fps, luma, std, diff))
+
+    cap.release()
+
+    for i in range(1, len(records)):
+        idx, sec, luma, std, diff = records[i]
+        tail_sec = (total - idx) / fps
+        if 1.5 <= tail_sec <= 4.2:
+            if diff > 25.0 or (luma < 35.0 and records[i - 1][2] > 55.0):
+                post_records = records[i:]
+                post_lumas = [r[2] for r in post_records]
+                post_stds = [r[3] for r in post_records]
+                if np.mean(post_lumas) < 45.0 and np.mean(post_stds) < 25.0:
+                    return idx, sec
+    return None, None
+
+
+def detect_timed_watermarks_hybrid(video_path: Path | str) -> DetectionResult:
+    """Hybrid timed watermark detector: outro detection + OCR + temporal energy.
+
+    1. Scans for an appended platform outro and determines content_end_frame.
+    2. Runs OCR across sample frames to locate text and adjacent logo boxes,
+       strictly excluding the central subject safety zone [0.25W..0.75W, 0.20H..0.80H].
+    3. Refines each box's exact [start_s, end_s] using edge energy variance over time.
+    4. Falls back to sliding-window temporal median if OCR is unavailable.
+    """
+    video_path = Path(video_path)
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+
+    if total <= 0 or width <= 0 or height <= 0:
+        return DetectionResult(False, "无法读取视频信息", [], None, None, 0, {})
+
+    outro_cut_frame, outro_cut_s = detect_outro_cut(video_path)
+    content_end_frame = outro_cut_frame if outro_cut_frame is not None else total
+    content_dur = content_end_frame / fps
+
+    api_dir = Path(__file__).resolve().parent.parent.parent
+    ai_worker_python = api_dir.parent / "ai-worker" / ".venv" / "Scripts" / "python.exe"
+    ocr_cli = api_dir.parent / "ai-worker" / "ocr_detector_cli.py"
+
+    ocr_boxes: list[dict] = []
+    if ai_worker_python.exists() and ocr_cli.exists():
+        try:
+            cmd = [
+                str(ai_worker_python),
+                str(ocr_cli),
+                "--video",
+                str(video_path),
+                "--end-frame",
+                str(content_end_frame),
+                "--sample-sec",
+                "1.5",
+            ]
+            proc = subprocess.run(cmd, capture_output=True, timeout=120, check=False)
+            stdout = proc.stdout.decode("utf-8", errors="replace")
+            for line in stdout.splitlines():
+                if line.startswith("OUTPUT_JSON:"):
+                    ocr_boxes = json.loads(line.removeprefix("OUTPUT_JSON:"))
+                    break
+        except Exception:
+            ocr_boxes = []
+
+    if ocr_boxes:
+        cap = cv2.VideoCapture(str(video_path))
+        sample_step = max(1, int(fps * 0.25))
+        timestamps = []
+        patch_vars: dict[int, list[float]] = {i: [] for i in range(len(ocr_boxes))}
+
+        for f_idx in range(0, content_end_frame, sample_step):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+            ret, frame = cap.read()
+            if not ret:
+                break
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            timestamps.append(f_idx / fps)
+            for i, b in enumerate(ocr_boxes):
+                bx, by, bw, bh = b["box"]
+                patch = gray[by : by + bh, bx : bx + bw]
+                patch_vars[i].append(float(cv2.Sobel(patch, cv2.CV_32F, 1, 1).var()))
+        cap.release()
+
+        detections: list[Detection] = []
+        static_mask = np.zeros((height, width), dtype=np.uint8)
+
+        for i, b in enumerate(ocr_boxes):
+            vars_arr = np.array(patch_vars[i])
+            if len(vars_arr) == 0:
+                continue
+            med_var = float(np.median(vars_arr))
+            max_var = float(np.max(vars_arr))
+            thr = max(200.0, med_var * 0.7 if med_var > 300.0 else max_var * 0.35)
+            active_indices = np.where(vars_arr >= thr)[0]
+            if len(active_indices) >= 2:
+                start_s = max(0.0, timestamps[active_indices[0]] - 0.2)
+                end_s = min(content_dur, timestamps[active_indices[-1]] + 0.35)
+                bx, by, bw, bh = (int(v) for v in b["box"])
+                det = Detection(
+                    box=(bx, by, bw, bh),
+                    area=bw * bh,
+                    score=float(b.get("confidence", 0.95)),
+                    kind="text",
+                    start_s=round(float(start_s), 2),
+                    end_s=round(float(end_s), 2),
+                )
+                detections.append(det)
+                cv2.rectangle(static_mask, (bx, by), (bx + bw, by + bh), 255, -1)
+
+        if detections:
+            stats = {
+                "method": "hybrid_ocr",
+                "outro_cut_frame": outro_cut_frame,
+                "content_frames": content_end_frame,
+                "detections_count": len(detections),
+            }
+            return DetectionResult(
+                ok=True,
+                reason=f"通过混合分析定位到 {len(detections)} 处分时水印",
+                detections=detections,
+                static_mask=static_mask,
+                per_frame_masks=None,
+                frame_count=content_end_frame,
+                stats=stats,
+                outro_cut_frame=outro_cut_frame,
+                outro_cut_s=outro_cut_s,
+            )
+
+    # Fallback: read frames up to content_end_frame and run standard detector
+    cap = cv2.VideoCapture(str(video_path))
+    fallback_frames = []
+    read_step = max(1, content_end_frame // 40) if content_end_frame > 60 else 1
+    for f_idx in range(0, content_end_frame, read_step):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        fallback_frames.append(frame)
+    cap.release()
+
+    res = detect_watermarks(fallback_frames)
+    res.outro_cut_frame = outro_cut_frame
+    res.outro_cut_s = outro_cut_s
+    return res

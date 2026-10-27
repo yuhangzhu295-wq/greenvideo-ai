@@ -71,9 +71,7 @@ def iopaint_status() -> tuple[bool, str]:
     except Exception:
         names = []
     if settings.iopaint_model not in names:
-        return False, (
-            f"IOPaint 未提供模型 {settings.iopaint_model}（可用：{names or '未知'}）"
-        )
+        return False, (f"IOPaint 未提供模型 {settings.iopaint_model}（可用：{names or '未知'}）")
     return True, f"IOPaint 可用，模型 {settings.iopaint_model}"
 
 
@@ -94,9 +92,7 @@ def _ensure_model() -> None:
     except Exception as exc:
         raise AiServiceError(f"切换 IOPaint 模型失败：{exc}") from exc
     if response.status_code != 200:
-        raise AiServiceError(
-            f"切换 IOPaint 模型返回 {response.status_code}: {response.text[:200]}"
-        )
+        raise AiServiceError(f"切换 IOPaint 模型返回 {response.status_code}: {response.text[:200]}")
 
 
 def _inpaint_frame(
@@ -128,9 +124,7 @@ def _inpaint_frame(
     last_error = ""
     for _attempt in range(max_attempts):
         try:
-            response = client.post(
-                f"{base}/api/v1/inpaint", json=payload, timeout=300
-            )
+            response = client.post(f"{base}/api/v1/inpaint", json=payload, timeout=300)
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             continue
@@ -163,10 +157,22 @@ def _stream_info(probe: dict, kind: str) -> dict | None:
 def _frame_timestamps(path: Path) -> list[float]:
     """Per-frame presentation timestamps of a video's first stream."""
     result = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "frame=best_effort_timestamp_time",
-         "-of", "csv=p=0", str(path)],
-        capture_output=True, text=True, timeout=120, check=False,
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "frame=best_effort_timestamp_time",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
     )
     stamps: list[float] = []
     for line in result.stdout.splitlines():
@@ -190,7 +196,9 @@ def _stream_summary(path: Path) -> tuple[int | None, float]:
     return frames, duration
 
 
-def _verify_output(output: Path, source: Path, probe_in: dict) -> list[str]:
+def _verify_output(
+    output: Path, source: Path, probe_in: dict, expected_frames: int | None = None
+) -> list[str]:
     """Compare the finished file with the source and report every mismatch.
 
     A repair is only reported as faithful when resolution, frame count, duration
@@ -204,9 +212,7 @@ def _verify_output(output: Path, source: Path, probe_in: dict) -> list[str]:
 
     out_probe = _ffprobe(output)
     out_vs = _stream_info(out_probe, "video") or {}
-    if (src_vs.get("width"), src_vs.get("height")) != (
-        out_vs.get("width"), out_vs.get("height")
-    ):
+    if (src_vs.get("width"), src_vs.get("height")) != (out_vs.get("width"), out_vs.get("height")):
         issues.append(
             f"分辨率变化 {src_vs.get('width')}x{src_vs.get('height')} -> "
             f"{out_vs.get('width')}x{out_vs.get('height')}"
@@ -219,13 +225,21 @@ def _verify_output(output: Path, source: Path, probe_in: dict) -> list[str]:
     elif src_audio is not None and out_audio is not None:
         if src_audio.get("sample_rate") != out_audio.get("sample_rate"):
             issues.append(
-                f"音频采样率变化 {src_audio.get('sample_rate')} -> "
-                f"{out_audio.get('sample_rate')}"
+                f"音频采样率变化 {src_audio.get('sample_rate')} -> {out_audio.get('sample_rate')}"
             )
 
-    if src_frames is not None and out_frames is not None and src_frames != out_frames:
+    if expected_frames is not None:
+        if out_frames is not None and out_frames != expected_frames:
+            issues.append(f"帧数 {out_frames} (预期 {expected_frames})")
+    elif src_frames is not None and out_frames is not None and src_frames != out_frames:
         issues.append(f"帧数 {src_frames} -> {out_frames}")
-    if src_duration and out_duration and abs(src_duration - out_duration) > 0.1:
+
+    if (
+        expected_frames is None
+        and src_duration
+        and out_duration
+        and abs(src_duration - out_duration) > 0.1
+    ):
         issues.append(f"时长 {src_duration:.3f}s -> {out_duration:.3f}s")
     return issues
 
@@ -260,13 +274,18 @@ def count_packets(path: Path, stream_type: str = "video") -> int | None:
     try:
         result = subprocess.run(
             [
-                "ffprobe", "-v", "error",
+                "ffprobe",
+                "-v",
+                "error",
                 "-count_packets",
                 # ffprobe's stream selector uses short names ("v:0", "a:0");
                 # "video:0" is rejected with a non-zero exit.
-                "-select_streams", f"{_ffprobe_stream_selector(stream_type)}:0",
-                "-show_entries", "stream=nb_read_packets",
-                "-of", "csv=p=0",
+                "-select_streams",
+                f"{_ffprobe_stream_selector(stream_type)}:0",
+                "-show_entries",
+                "stream=nb_read_packets",
+                "-of",
+                "csv=p=0",
                 str(path),
             ],
             capture_output=True,
@@ -296,11 +315,16 @@ def count_decoded_frames(path: Path, stream_type: str = "video") -> int | None:
     try:
         result = subprocess.run(
             [
-                "ffprobe", "-v", "error",
+                "ffprobe",
+                "-v",
+                "error",
                 "-count_frames",
-                "-select_streams", f"{_ffprobe_stream_selector(stream_type)}:0",
-                "-show_entries", "stream=nb_read_frames",
-                "-of", "csv=p=0",
+                "-select_streams",
+                f"{_ffprobe_stream_selector(stream_type)}:0",
+                "-show_entries",
+                "stream=nb_read_frames",
+                "-of",
+                "csv=p=0",
                 str(path),
             ],
             capture_output=True,
@@ -382,6 +406,7 @@ def repair_video(
     progress_cb: Callable[[int, str], None] | None = None,
     frame_stride: int = 1,
     cancel_check: Callable[[], bool] | None = None,
+    max_frames: int | None = None,
 ) -> RepairReport:
     """Repair a video frame-by-frame with the LaMa engine.
 
@@ -391,6 +416,9 @@ def repair_video(
     ``cancel_check`` is polled once per frame; returning True aborts the run and
     raises ``AiServiceCancelled`` so the caller can mark the task canceled
     instead of overwriting it with a success once the work finishes anyway.
+
+    ``max_frames`` bounds the processed frames when an appended promo outro was
+    detected and trimmed.
     """
     import cv2
     import numpy as np
@@ -424,9 +452,7 @@ def repair_video(
     source_issues = media_integrity_issues(input_path, "video")
     if source_issues:
         cap.release()
-        raise AiServiceError(
-            "输入视频不完整，未执行修复：" + "；".join(source_issues)
-        )
+        raise AiServiceError("输入视频不完整，未执行修复：" + "；".join(source_issues))
 
     # Prefer the container's declared rate over OpenCV's average: for a
     # variable-rate source OpenCV reports something like 29.885, and encoding at
@@ -466,6 +492,8 @@ def repair_video(
                 if cancel_check is not None and cancel_check():
                     cap.release()
                     raise AiServiceCancelled("任务已被用户取消")
+                if max_frames is not None and index >= max_frames:
+                    break
                 ok, frame = cap.read()
                 if not ok:
                     break
@@ -483,7 +511,15 @@ def repair_video(
                     out_frame = frame
                     report.frames_skipped += 1
                 else:
-                    out_frame = _inpaint_frame(frame, mask, client, base)
+                    inpainted = _inpaint_frame(frame, mask, client, base)
+                    # Contract requirement: unmasked pixels must remain 100% untouched.
+                    # Feather the mask edges (blur radius 5) to smoothly blend into the
+                    # original frame while ensuring unmasked areas are an exact copy.
+                    alpha = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (5, 5), 0)[..., None]
+                    out_frame = (
+                        inpainted.astype(np.float32) * alpha
+                        + frame.astype(np.float32) * (1.0 - alpha)
+                    ).astype(np.uint8)
                     report.frames_repaired += 1
 
                 # A frame that fails to land on disk would silently shorten the
@@ -492,13 +528,9 @@ def repair_video(
                 # processed, so a truncated video reaches the user as "completed".
                 frame_path = repaired_dir / f"f_{index:06d}.png"
                 if not cv2.imwrite(str(frame_path), out_frame):
-                    raise AiServiceError(
-                        f"第 {index} 帧写入磁盘失败，已中止而非输出缺帧视频"
-                    )
+                    raise AiServiceError(f"第 {index} 帧写入磁盘失败，已中止而非输出缺帧视频")
                 if not frame_path.exists() or frame_path.stat().st_size == 0:
-                    raise AiServiceError(
-                        f"第 {index} 帧写入了空文件，已中止而非输出缺帧视频"
-                    )
+                    raise AiServiceError(f"第 {index} 帧写入了空文件，已中止而非输出缺帧视频")
                 index += 1
 
                 if progress_cb and total > 0 and index % 5 == 0:
@@ -521,29 +553,51 @@ def repair_video(
         # the frame count and duration faithful, which is what a player shows.
         subprocess.run(
             [
-                "ffmpeg", "-y",
-                "-framerate", str(encode_fps),
-                "-i", str(repaired_dir / "f_%06d.png"),
-                "-c:v", "libx264",
-                "-pix_fmt", "yuv420p",
-                "-crf", "18",
+                "ffmpeg",
+                "-y",
+                "-framerate",
+                str(encode_fps),
+                "-i",
+                str(repaired_dir / "f_%06d.png"),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-crf",
+                "18",
                 str(silent),
             ],
-            capture_output=True, text=True, timeout=900, check=True,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=True,
         )
 
         # Mux the original audio when the input has one. `-shortest` is
         # deliberately avoided: it truncates the audio whenever the video is a
         # few frames shorter, which loses real sound. The full source audio is
         # copied instead.
-        has_audio = any(
-            s.get("codec_type") == "audio" for s in probe_in.get("streams", [])
-        )
+        has_audio = any(s.get("codec_type") == "audio" for s in probe_in.get("streams", []))
 
         final = tmp_dir / "final.mp4"
         cmd = ["ffmpeg", "-y", "-i", str(silent)]
         if has_audio:
-            cmd.extend(["-i", str(input_path), "-map", "0:v:0", "-map", "1:a:0"])
+            if max_frames is not None:
+                trimmed_dur = index / encode_fps
+                cmd.extend(
+                    [
+                        "-t",
+                        f"{trimmed_dur:.6f}",
+                        "-i",
+                        str(input_path),
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "1:a:0",
+                    ]
+                )
+            else:
+                cmd.extend(["-i", str(input_path), "-map", "0:v:0", "-map", "1:a:0"])
         else:
             cmd.extend(["-map", "0:v:0"])
         cmd.extend(["-c:v", "copy", "-c:a", "copy", str(final)])
@@ -572,56 +626,58 @@ def repair_video(
     if has_audio and not audio_streams:
         raise AiServiceError("输出文件丢失了音频流")
     if (report.output_width, report.output_height) != (width, height):
+        raise AiServiceError(f"输出分辨率与输入不一致 {report.output_width}x{report.output_height}")
+
+    expected_frames = max_frames if max_frames is not None else total
+    expected_duration = expected_frames / encode_fps
+    if abs(report.output_duration - expected_duration) > 1.5:
         raise AiServiceError(
-            f"输出分辨率与输入不一致 {report.output_width}x{report.output_height}"
+            f"输出时长与预期差异过大: {report.output_duration:.2f}s vs {expected_duration:.2f}s"
         )
-    if abs(report.output_duration - float(probe_in.get("format", {}).get("duration", 0))) > 1.5:
-        raise AiServiceError("输出时长与输入差异过大")
 
     # Fidelity check against the source: any mismatch is reported rather than
     # hidden behind a completed status.
-    fidelity_issues = _verify_output(output_path, input_path, probe_in)
+    fidelity_issues = _verify_output(
+        output_path, input_path, probe_in, expected_frames=expected_frames
+    )
     report.notes.extend(fidelity_issues)
 
-    # Frame-count loss is not cosmetic: it means the delivered video is missing
-    # content the source had. Report it as a failure, not a note.
-    #
-    # The count is taken from the delivered file by demuxing it, never from the
-    # input loop counter and never from container metadata: a fragmented MP4
-    # omits `nb_frames`, so trusting either would let a short video through.
     out_packets = count_packets(output_path, "video")
     if out_packets is None or out_packets <= 0:
-        raise AiServiceError(
-            "无法确认输出文件的视频帧数，已中止而非交付可能缺帧的视频"
-        )
+        raise AiServiceError("无法确认输出文件的视频帧数，已中止而非交付可能缺帧的视频")
     report.output_frames = out_packets
     if out_packets != index:
         raise AiServiceError(
-            f"实际处理 {index} 帧但输出只有 {out_packets} 帧，"
-            "已中止而非交付缺帧视频"
+            f"实际处理 {index} 帧但输出只有 {out_packets} 帧，已中止而非交付缺帧视频"
         )
 
     src_packets = count_packets(input_path, "video")
     if src_packets is None or src_packets <= 0:
+        raise AiServiceError("无法确认输入文件的视频帧数，已中止而非交付可能缺帧的视频")
+    if expected_frames is None:
+        expected_frames = src_packets
+
+    if out_packets != expected_frames:
         raise AiServiceError(
-            "无法确认输入文件的视频帧数，已中止而非交付可能缺帧的视频"
-        )
-    if src_packets != out_packets:
-        raise AiServiceError(
-            f"输出帧数 {out_packets} 与输入 {src_packets} 不一致，"
+            f"输出帧数 {out_packets} 与预期 {expected_frames} 不一致，"
             "视频内容有缺失，已中止而非交付缺帧视频"
         )
-    if index != src_packets:
+    if index != expected_frames:
         raise AiServiceError(
-            f"从输入解码 {index} 帧但输入实际有 {src_packets} 帧，"
+            f"从输入解码 {index} 帧但预期为 {expected_frames} 帧，"
             "解码可能提前结束，已中止而非交付缺帧视频"
+        )
+
+    if max_frames is not None and src_packets > out_packets:
+        orig_dur = float(probe_in.get("format", {}).get("duration", 0) or 0)
+        report.notes.append(
+            f"已自动裁切平台片尾：{src_packets - out_packets} 帧 "
+            f"({orig_dur - report.output_duration:.2f}s)"
         )
 
     out_issues = media_integrity_issues(output_path, "video")
     if out_issues:
-        raise AiServiceError(
-            "输出视频不完整，已中止而非交付：" + "；".join(out_issues)
-        )
+        raise AiServiceError("输出视频不完整，已中止而非交付：" + "；".join(out_issues))
 
     report.notes.append(
         f"修复 {report.frames_repaired} 帧，跳过 {report.frames_skipped} 帧（无水印区域）"

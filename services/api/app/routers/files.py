@@ -78,8 +78,7 @@ def get_file(file_id: str) -> FileResponse:
                 status_code=409,
                 detail={
                     "code": "OUTPUT_NOT_PLAYABLE",
-                    "message": f"输出文件的{label}不完整，请重新执行处理任务："
-                    + "；".join(issues),
+                    "message": f"输出文件的{label}不完整，请重新执行处理任务：" + "；".join(issues),
                 },
             )
     return FileResponse(output_path, filename=output_path.name)

@@ -66,15 +66,13 @@ function buildTimedRegions(
   const H = mediaSize.height;
   const split = Math.max(0.1, splitSeconds);
   const head = presetRegions(preset, W, H).map((r) => ({ ...r, start_s: 0, end_s: split }));
-  const cardY = Math.round(H * 0.21);
+  const cardY = Math.round(H * 0.82);
   return [
     ...head,
     {
-      x: Math.round(W * 0.19),
+      x: Math.round(W * 0.35),
       y: cardY,
-      w: Math.round(W * 0.62),
-      // Reach the frame bottom: an end-card watermark can sit flush against it,
-      // and stopping short leaves part of the logo in place.
+      w: Math.round(W * 0.30),
       h: H - cardY,
       start_s: split
     }
@@ -87,7 +85,7 @@ export default function WatermarkPage() {
   const [preset, setPreset] = useState<Preset>("douyin_both_corners");
   const [repairMode, setRepairMode] = useState<RepairMode>("opencv");
   const [removeSubtitle, setRemoveSubtitle] = useState(false);
-  const [autoDetect, setAutoDetect] = useState(false);
+  const [autoDetect, setAutoDetect] = useState(true);
   // Some clips change watermark layout mid-video (corner overlay, then a
   // centred end card). This adds a second region for the tail of the video.
   const [endCardWatermark, setEndCardWatermark] = useState(false);

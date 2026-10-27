@@ -38,7 +38,7 @@ def is_video_path(path: str | Path) -> bool:
 
 
 def _audio_stream_status(path: Path) -> str:
-    """"present", "absent" or "unknown" for a file's audio.
+    """ "present", "absent" or "unknown" for a file's audio.
 
     "unknown" must never be treated as "absent": a failed probe says nothing
     about the content, and acting as though the source had no audio is what let
@@ -126,6 +126,7 @@ class _OverlayMaskProvider:
             return base
         return np.maximum(np.asarray(base, dtype=np.uint8), self.overlay)
 
+
 class TimedMaskProvider:
     """Build a per-frame mask from time-scoped regions.
 
@@ -135,8 +136,9 @@ class TimedMaskProvider:
     actually is instead of blanketing the whole video with every region.
     """
 
-    def __init__(self, regions, height: int, width: int, fps: float,
-                 timestamps: list[float] | None = None) -> None:
+    def __init__(
+        self, regions, height: int, width: int, fps: float, timestamps: list[float] | None = None
+    ) -> None:
         self.regions = list(regions)
         self.height = height
         self.width = width
@@ -575,6 +577,7 @@ class WatermarkProcessor:
         remove_subtitle: bool = False,
         cancel_check: Callable[[], bool] | None = None,
         timed_mask_regions: list | None = None,
+        max_frames: int | None = None,
     ) -> Path:
         input_path = Path(input_path)
         output_path = Path(output_path)
@@ -648,9 +651,7 @@ class WatermarkProcessor:
         source_issues = media_integrity_issues(input_path, "video")
         if source_issues:
             cap.release()
-            raise AiServiceError(
-                "输入视频不完整，未执行修复：" + "；".join(source_issues)
-            )
+            raise AiServiceError("输入视频不完整，未执行修复：" + "；".join(source_issues))
 
         mask = self._generate_mask((height, width), mask_regions, mask_preset, remove_subtitle)
 
@@ -701,6 +702,7 @@ class WatermarkProcessor:
                 mask_provider,
                 progress_cb=progress_cb,
                 cancel_check=cancel_check,
+                max_frames=max_frames,
             )
             # A run that repaired no frame has not removed anything, so it must
             # not be reported as a successful AI repair however the engine was
@@ -749,6 +751,10 @@ class WatermarkProcessor:
 
         import numpy as np
 
+        src_packets = _stream_frame_count(input_path)
+        if src_packets is None or src_packets <= 0:
+            raise AiServiceError("无法确认输入文件的视频帧数，已中止而非输出可能缺帧的视频")
+
         repaired_frames = 0
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_video = Path(temp_dir) / "video_no_audio.mp4"
@@ -760,9 +766,7 @@ class WatermarkProcessor:
             # completed repair.
             if not writer.isOpened():
                 writer.release()
-                raise AiServiceError(
-                    "无法创建视频写出器（编码器不可用），未执行修复。"
-                )
+                raise AiServiceError("无法创建视频写出器（编码器不可用），未执行修复。")
             frame_count = 0
             while True:
                 if cancel_check is not None and cancel_check():
@@ -771,6 +775,8 @@ class WatermarkProcessor:
                     from app.services.video_repair import AiServiceCancelled
 
                     raise AiServiceCancelled("任务已被用户取消")
+                if max_frames is not None and frame_count >= max_frames:
+                    break
                 ok, frame = cap.read()
                 if not ok:
                     break
@@ -794,18 +800,10 @@ class WatermarkProcessor:
             if frame_count == 0:
                 raise AiServiceError("未能从输入视频解码任何帧")
 
-            # A source that opens but stops decoding early (truncated tail, broken
-            # index) makes cap.read() return False long before the real end. That
-            # must not be treated as a normal end-of-file: the delivered video
-            # would silently contain only the frames decoded so far.
-            src_packets = _stream_frame_count(input_path)
-            if src_packets is None or src_packets <= 0:
+            expected_frames = max_frames if max_frames is not None else src_packets
+            if frame_count != expected_frames:
                 raise AiServiceError(
-                    "无法确认输入文件的视频帧数，已中止而非输出可能缺帧的视频"
-                )
-            if frame_count != src_packets:
-                raise AiServiceError(
-                    f"从输入解码 {frame_count} 帧但输入实际有 {src_packets} 帧，"
+                    f"从输入解码 {frame_count} 帧但预期有 {expected_frames} 帧，"
                     "解码可能提前结束，已中止而非输出缺帧视频"
                 )
 
@@ -836,14 +834,14 @@ class WatermarkProcessor:
                 # `-shortest` truncates the audio when the video is shorter than
                 # the track, so the full source audio is copied instead.
                 combined = Path(temp_dir) / "combined.mp4"
-                mux = subprocess.run(
+                mux_cmd = ["ffmpeg", "-y", "-i", str(temp_video)]
+                if max_frames is not None:
+                    trimmed_dur = frame_count / fps
+                    mux_cmd.extend(["-t", f"{trimmed_dur:.6f}", "-i", str(input_path)])
+                else:
+                    mux_cmd.extend(["-i", str(input_path)])
+                mux_cmd.extend(
                     [
-                        "ffmpeg",
-                        "-y",
-                        "-i",
-                        str(temp_video),
-                        "-i",
-                        str(input_path),
                         "-map",
                         "0:v:0",
                         "-map",
@@ -853,7 +851,10 @@ class WatermarkProcessor:
                         "-c:a",
                         "copy",
                         str(combined),
-                    ],
+                    ]
+                )
+                mux = subprocess.run(
+                    mux_cmd,
                     capture_output=True,
                     text=True,
                     timeout=180,
@@ -874,9 +875,7 @@ class WatermarkProcessor:
                         raise AiServiceError("无法确认输出是否包含音轨，已中止")
                     shutil.copyfile(combined, output_path)
                 elif source_audio == "present":
-                    raise AiServiceError(
-                        f"音轨合流失败（ffmpeg 返回码 {mux.returncode}）"
-                    )
+                    raise AiServiceError(f"音轨合流失败（ffmpeg 返回码 {mux.returncode}）")
                 elif source_audio == "unknown":
                     # The source's audio could not be determined, so a silent
                     # result cannot be ruled out and must not be reported as a
@@ -887,9 +886,7 @@ class WatermarkProcessor:
             elif _audio_stream_status(input_path) != "absent":
                 # Without ffmpeg the audio track cannot be carried over, so the
                 # result would be a muted video. That is not a finished repair.
-                raise AiServiceError(
-                    "FFmpeg 不可用，无法保留原始音轨；已中止而非输出无音轨视频。"
-                )
+                raise AiServiceError("FFmpeg 不可用，无法保留原始音轨；已中止而非输出无音轨视频。")
             else:
                 shutil.copyfile(temp_video, output_path)
 
@@ -900,21 +897,17 @@ class WatermarkProcessor:
             raise AiServiceError("输出文件为空，未执行修复。")
         out_packets = _stream_frame_count(output_path)
         if out_packets is None or out_packets <= 0:
+            raise AiServiceError("无法确认输出文件的视频帧数，已中止而非交付可能缺帧的视频")
+        expected_frames = max_frames if max_frames is not None else src_packets
+        if out_packets != expected_frames:
             raise AiServiceError(
-                "无法确认输出文件的视频帧数，已中止而非交付可能缺帧的视频"
-            )
-        if out_packets != frame_count:
-            raise AiServiceError(
-                f"输出文件只有 {out_packets} 帧（应为 {frame_count}），"
-                "已中止而非交付缺帧视频"
+                f"输出文件只有 {out_packets} 帧（应为 {expected_frames}），已中止而非交付缺帧视频"
             )
         # The delivered file must also decode, and must match whatever its own
         # header claims. A truncated encode otherwise looks complete.
         out_issues = media_integrity_issues(output_path, "video")
         if out_issues:
-            raise AiServiceError(
-                "输出视频不完整，已中止而非交付：" + "；".join(out_issues)
-            )
+            raise AiServiceError("输出视频不完整，已中止而非交付：" + "；".join(out_issues))
 
         if repaired_frames == 0:
             self._record_engine(

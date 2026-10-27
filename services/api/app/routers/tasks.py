@@ -104,14 +104,12 @@ def _timed_region_peak_coverage_pct(regions, width: int, height: int) -> float:
     """
     if not regions or width <= 0 or height <= 0:
         return 0.0
-    boundaries = sorted({r.start_s for r in regions}
-                        | {r.end_s for r in regions if r.end_s is not None})
+    boundaries = sorted(
+        {r.start_s for r in regions} | {r.end_s for r in regions if r.end_s is not None}
+    )
     peak = 0.0
     for t in boundaries:
-        active = [
-            r for r in regions
-            if r.start_s <= t and (r.end_s is None or t < r.end_s)
-        ]
+        active = [r for r in regions if r.start_s <= t and (r.end_s is None or t < r.end_s)]
         if not active:
             continue
         canvas = np.zeros((height, width), dtype=bool)
@@ -124,6 +122,7 @@ def _timed_region_peak_coverage_pct(regions, width: int, height: int) -> float:
                 canvas[y1:y2, x1:x2] = True
         peak = max(peak, float(canvas.mean()))
     return 100.0 * peak
+
 
 def _probe_frame_size(path: Path) -> tuple[int, int]:
     """(width, height) of a video's first stream, or (0, 0) when unknown."""
@@ -140,6 +139,7 @@ def _probe_frame_size(path: Path) -> tuple[int, int]:
         return w, h
     except Exception:
         return 0, 0
+
 
 def _region_coverage_pct(regions: list[MaskRegion], width: int = 0, height: int = 0) -> float:
     """Share of the frame covered by the union of the given regions."""
@@ -162,6 +162,7 @@ def _region_coverage_pct(regions: list[MaskRegion], width: int = 0, height: int 
             canvas[y1:y2, x1:x2] = True
     return 100.0 * float(canvas.mean())
 
+
 def _discard_output(output: Path | None) -> None:
     """Remove an unfinished output so a failed task never leaves a file behind."""
     if output is None:
@@ -173,43 +174,10 @@ def _discard_output(output: Path | None) -> None:
 
 
 def _detect_source_watermark(source_path: Path):
-    """Sample frames from the upload and locate persistent watermark regions."""
-    import cv2
+    """Detect watermark regions and optional promo outro using hybrid detection."""
+    from app.services.watermark_detect import detect_timed_watermarks_hybrid
 
-    from app.services.watermark_detect import detect_watermarks
-
-    cap = cv2.VideoCapture(str(source_path))
-    if not cap.isOpened():
-        cap.release()
-        from app.services.watermark_detect import DetectionResult
-
-        return DetectionResult(False, "无法解码上传视频", [], None, None, 0, {})
-
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    frames: list = []
-    if total > 40:
-        step = max(1, total // 30)
-        idx = 0
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            if idx % step == 0 and len(frames) < 30:
-                frames.append(frame)
-            idx += 1
-    else:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            frames.append(frame)
-    cap.release()
-
-    if not frames:
-        from app.services.watermark_detect import DetectionResult
-
-        return DetectionResult(False, "视频中没有可解码帧", [], None, None, 0, {})
-    return detect_watermarks(frames)
+    return detect_timed_watermarks_hybrid(source_path)
 
 
 async def _run_download_task(task_id: str, payload: DownloadTaskRequest) -> None:
@@ -289,9 +257,7 @@ async def _run_download_task(task_id: str, payload: DownloadTaskRequest) -> None
             stage="下载完成",
             output_path=str(final),
         )
-        update_history_by_task(
-            task_id, status="success", size_mb=_size_mb(final, 0.01)
-        )
+        update_history_by_task(task_id, status="success", size_mb=_size_mb(final, 0.01))
     except DownloadError as exc:
         update_task(
             task_id,
@@ -403,8 +369,10 @@ def _parse_timed_mask_regions(raw: Any) -> list[TimedMaskRegion]:
     except json.JSONDecodeError as exc:
         raise HTTPException(
             status_code=400,
-            detail={"code": "INVALID_TIMED_MASK_REGIONS",
-                    "message": "timed_mask_regions 必须是 JSON 数组。"},
+            detail={
+                "code": "INVALID_TIMED_MASK_REGIONS",
+                "message": "timed_mask_regions 必须是 JSON 数组。",
+            },
         ) from exc
     return [TimedMaskRegion.model_validate(item) for item in data]
 
@@ -477,6 +445,8 @@ async def _run_watermark_task(
         # cannot find a confident region the task fails instead of masking the
         # whole picture.
         mask_regions = list(payload.mask_regions)
+        effective_timed_regions = list(payload.timed_mask_regions)
+        target_max_frames: int | None = None
         mask_preset = payload.mask_preset
         frame_width = frame_height = 0
         # Auto-detection and hand-picked time-scoped regions describe the same
@@ -494,11 +464,9 @@ async def _run_watermark_task(
             update_history_by_task(task_id, status="failed")
             return
         if payload.auto_detect and source_path and suffix in VIDEO_EXT:
-            _safe_stage(task_id, 12, "正在检测水印区域")
+            _safe_stage(task_id, 12, "正在检测水印区域与片尾")
             frame_width, frame_height = _probe_frame_size(source_path)
-            detection = await asyncio.to_thread(
-                _detect_source_watermark, source_path
-            )
+            detection = await asyncio.to_thread(_detect_source_watermark, source_path)
             if not detection.ok:
                 update_task(
                     task_id,
@@ -510,11 +478,31 @@ async def _run_watermark_task(
                 update_history_by_task(task_id, status="failed")
                 return
             mask_preset = "custom"
-            mask_regions = [
-                MaskRegion(x=det.box[0], y=det.box[1], w=det.box[2], h=det.box[3])
-                for det in detection.detections
+            target_max_frames = detection.outro_cut_frame
+
+            timed_dets = [
+                d for d in detection.detections if d.start_s is not None or d.end_s is not None
             ]
-            if not mask_regions:
+            if timed_dets:
+                effective_timed_regions = [
+                    TimedMaskRegion(
+                        x=det.box[0],
+                        y=det.box[1],
+                        w=det.box[2],
+                        h=det.box[3],
+                        start_s=det.start_s or 0.0,
+                        end_s=det.end_s,
+                    )
+                    for det in timed_dets
+                ]
+                mask_regions = []
+            else:
+                mask_regions = [
+                    MaskRegion(x=det.box[0], y=det.box[1], w=det.box[2], h=det.box[3])
+                    for det in detection.detections
+                ]
+
+            if not effective_timed_regions and not mask_regions:
                 update_task(
                     task_id,
                     status="failed",
@@ -528,7 +516,12 @@ async def _run_watermark_task(
             # A detector that reports most of the frame has found scene structure,
             # not a watermark. Repairing that would destroy the picture, so the
             # task fails and asks for a manual region instead of proceeding.
-            coverage_pct = _region_coverage_pct(mask_regions, frame_width, frame_height)
+            if effective_timed_regions:
+                coverage_pct = _timed_region_peak_coverage_pct(
+                    effective_timed_regions, frame_width, frame_height
+                )
+            else:
+                coverage_pct = _region_coverage_pct(mask_regions, frame_width, frame_height)
             if coverage_pct > AUTO_DETECT_MAX_COVERAGE_PCT:
                 update_task(
                     task_id,
@@ -547,17 +540,23 @@ async def _run_watermark_task(
             _safe_stage(
                 task_id,
                 16,
-                f"已自动检测到 {len(mask_regions)} 个水印区域"
+                f"已自动检测到 {len(effective_timed_regions or mask_regions)} 个水印区域"
                 f"（覆盖 {coverage_pct:.1f}% 画面），开始修复",
             )
             # Record what the detector actually produced so the run can be
             # audited later instead of only showing the pre-detection payload.
+            audit_regions = (
+                [r.model_dump() for r in effective_timed_regions]
+                if effective_timed_regions
+                else [r.model_dump() for r in mask_regions]
+            )
             update_task(
                 task_id,
                 input={
                     **payload.model_dump(),
-                    "auto_detect_regions": [r.model_dump() for r in mask_regions],
+                    "auto_detect_regions": audit_regions,
                     "source_path": str(source_path) if source_path else None,
+                    "outro_cut_frame": target_max_frames,
                 },
             )
 
@@ -609,6 +608,7 @@ async def _run_watermark_task(
             engine = processor.last_engine
             engine_note = processor.last_engine_note
         elif source_path and suffix in VIDEO_EXT and is_video_path(source_path):
+
             def progress(progress: int, stage: str) -> None:
                 _safe_stage(task_id, progress, stage)
 
@@ -622,7 +622,8 @@ async def _run_watermark_task(
                 mask_preset,
                 payload.remove_subtitle,
                 is_canceled,
-                payload.timed_mask_regions,
+                effective_timed_regions,
+                target_max_frames,
             )
             engine = processor.last_engine
             engine_note = processor.last_engine_note

@@ -55,16 +55,47 @@ def make_video(path: Path, frames: int = 4, size: tuple[int, int] = (160, 96)) -
         cv2.imwrite(str(frames_dir / f"f_{i:06d}.png"), img)
     silent = path.parent / f"_silent_{path.stem}.mp4"
     subprocess.run(
-        ["ffmpeg", "-y", "-framerate", "10", "-i", str(frames_dir / "f_%06d.png"),
-         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(silent)],
-        capture_output=True, check=True, timeout=300,
+        [
+            "ffmpeg",
+            "-y",
+            "-framerate",
+            "10",
+            "-i",
+            str(frames_dir / "f_%06d.png"),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(silent),
+        ],
+        capture_output=True,
+        check=True,
+        timeout=300,
     )
     subprocess.run(
-        ["ffmpeg", "-y", "-i", str(silent),
-         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=1",
-         "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
-         "-shortest", str(path)],
-        capture_output=True, check=True, timeout=300,
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(silent),
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100:duration=1",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(path),
+        ],
+        capture_output=True,
+        check=True,
+        timeout=300,
     )
 
 
@@ -249,8 +280,7 @@ def test_p0_4b_file_endpoint_rejects_empty_output(tmp_path: Path, monkeypatch) -
     empty = tmp_path / "empty.mp4"
     empty.write_bytes(b"")
     task = FakeTask(
-        {"id": "task_empty", "type": "watermark", "status": "completed",
-         "output_path": str(empty)}
+        {"id": "task_empty", "type": "watermark", "status": "completed", "output_path": str(empty)}
     )
     monkeypatch.setattr(files_router, "get_task", lambda _id: task)
 
@@ -262,9 +292,7 @@ def test_p0_4b_file_endpoint_rejects_empty_output(tmp_path: Path, monkeypatch) -
     assert exc.value.detail["code"] == "OUTPUT_EMPTY"
 
 
-def test_p0_5_fragmented_output_without_nb_frames_is_rejected(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_p0_5_fragmented_output_without_nb_frames_is_rejected(tmp_path: Path, monkeypatch) -> None:
     """A short output that omits nb_frames must not pass the frame-count guard.
 
     The reviewer's attack: the encoder silently drops a frame and the muxer
@@ -288,11 +316,24 @@ def test_p0_5_fragmented_output_without_nb_frames_is_rejected(
 
         cv2.imwrite(str(frames_dir / f"f_{i:06d}.png"), img)
     subprocess.run(
-        ["ffmpeg", "-y", "-framerate", "10", "-i", str(frames_dir / "f_%06d.png"),
-         "-c:v", "libx264", "-pix_fmt", "yuv420p",
-         "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
-         str(out)],
-        capture_output=True, check=True, timeout=300,
+        [
+            "ffmpeg",
+            "-y",
+            "-framerate",
+            "10",
+            "-i",
+            str(frames_dir / "f_%06d.png"),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+frag_keyframe+empty_moov+default_base_moof",
+            str(out),
+        ],
+        capture_output=True,
+        check=True,
+        timeout=300,
     )
     n_out = count_packets(out, "video")
     assert n_out == 3, f"fragmented fixture should have 3 packets, got {n_out}"
@@ -362,8 +403,12 @@ def test_p0_6_header_only_mp4_is_not_served(tmp_path: Path, monkeypatch) -> None
     assert count_decoded_frames(header_only) in (None, 0)
 
     task = FakeTask(
-        {"id": "task_header", "type": "watermark", "status": "completed",
-         "output_path": str(header_only)}
+        {
+            "id": "task_header",
+            "type": "watermark",
+            "status": "completed",
+            "output_path": str(header_only),
+        }
     )
     monkeypatch.setattr(files_router, "get_task", lambda _id: task)
 
@@ -390,14 +435,29 @@ def test_p0_7_truncated_source_video_is_rejected_before_repair(tmp_path: Path) -
         cv2.imwrite(str(frames / f"f_{i:06d}.png"), np.full((96, 128, 3), 40 + i, dtype=np.uint8))
     full = tmp_path / "full_src.mp4"
     subprocess.run(
-        ["ffmpeg", "-y", "-framerate", "10", "-i", str(frames / "f_%06d.png"),
-         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(full)],
-        capture_output=True, check=True, timeout=300,
+        [
+            "ffmpeg",
+            "-y",
+            "-framerate",
+            "10",
+            "-i",
+            str(frames / "f_%06d.png"),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(full),
+        ],
+        capture_output=True,
+        check=True,
+        timeout=300,
     )
     raw = full.read_bytes()
     trunc = tmp_path / "trunc_src.mp4"
     # Cut off 12% so some trailing packets are missing while moov header remains valid
-    trunc.write_bytes(raw[:int(len(raw) * 0.88)])
+    trunc.write_bytes(raw[: int(len(raw) * 0.88)])
 
     proc = WatermarkProcessor()
     out = tmp_path / "out_should_not_exist.mp4"
