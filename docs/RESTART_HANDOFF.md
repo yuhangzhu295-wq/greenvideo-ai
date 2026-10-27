@@ -5,7 +5,7 @@
 ## 项目位置与保护约束
 
 - 工作目录：`C:\Users\zyu33\Documents\Codex\greenvideo-ai`
-- 工作分支：`recovery/development`；原始基线和 `master`：`da209ee95327f7ac5a681371458791ef5f39b721`。本次仅作**本地提交**，不推送远程。
+- 工作分支：`recovery/development`；重启前本地检查点 commit：`85bf49445f578ef2815a7454baf79ec63ced4479`（`chore(recovery): checkpoint watermark and download work before restart`）。原始基线和 `master`：`da209ee95327f7ac5a681371458791ef5f39b721`。未推送远程。
 - 不删除/覆盖既存项目、用户视频、数据库或成果；不使用 `git reset --hard`、`git clean -fd`、强制推送；不绕过登录/DRM/付费访问；不以 demo、仅重编码、空文件或任务完成状态冒充实际修复。
 - `.env` 为本地配置，**不得提交**；`services/api/storage/` 和 `artifacts/` 在 `.gitignore` 内，依然存于本机磁盘但不会进入 Git 检查点。`services/api/tests/_test_storage/` 为测试产生的临时目录，不纳入提交。
 
