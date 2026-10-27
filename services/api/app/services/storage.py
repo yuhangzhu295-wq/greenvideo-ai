@@ -24,8 +24,7 @@ def create_demo_file(file_id: str) -> Path:
     path = storage_path("files", f"{safe_id}.txt")
     if not path.exists():
         path.write_text(
-            "GreenVideo AI demo result file.\n"
-            "真实生产环境会在这里返回任务生成的签名下载文件。\n",
+            "GreenVideo AI demo result file.\n真实生产环境会在这里返回任务生成的签名下载文件。\n",
             encoding="utf-8",
         )
     return path

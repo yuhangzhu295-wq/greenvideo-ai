@@ -10,9 +10,7 @@ class Settings:
     app_name: str = "GreenVideo AI"
     database_url: str = os.getenv("GREENVIDEO_DATABASE_URL", "sqlite:///./storage/greenvideo.db")
     storage_dir: Path = Path(os.getenv("GREENVIDEO_STORAGE_DIR", "./storage"))
-    celery_broker_url: str = os.getenv(
-        "GREENVIDEO_CELERY_BROKER_URL", "redis://localhost:6379/0"
-    )
+    celery_broker_url: str = os.getenv("GREENVIDEO_CELERY_BROKER_URL", "redis://localhost:6379/0")
     celery_result_backend: str = os.getenv(
         "GREENVIDEO_CELERY_RESULT_BACKEND", "redis://localhost:6379/1"
     )

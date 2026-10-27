@@ -13,9 +13,7 @@ import pytest
 TEST_ROOT = Path(__file__).resolve().parent / "_test_storage"
 
 # Four slashes: "sqlite:///" + an absolute POSIX path.
-os.environ["GREENVIDEO_DATABASE_URL"] = (
-    f"sqlite:///{(TEST_ROOT / 'test_greenvideo.db').as_posix()}"
-)
+os.environ["GREENVIDEO_DATABASE_URL"] = f"sqlite:///{(TEST_ROOT / 'test_greenvideo.db').as_posix()}"
 os.environ["GREENVIDEO_STORAGE_DIR"] = str(TEST_ROOT)
 os.environ["GREENVIDEO_IOPAINT_ENABLED"] = "false"
 

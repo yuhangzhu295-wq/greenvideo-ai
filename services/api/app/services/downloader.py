@@ -240,13 +240,9 @@ class VideoDownloader:
 
         selected: list[FormatDTO] = []
         if mp4_formats:
-            heights = sorted(
-                {(fmt.get("height") or 0) for fmt in mp4_formats}, reverse=True
-            )
+            heights = sorted({(fmt.get("height") or 0) for fmt in mp4_formats}, reverse=True)
             for height in heights[:2]:
-                item = next(
-                    fmt for fmt in mp4_formats if (fmt.get("height") or 0) == height
-                )
+                item = next(fmt for fmt in mp4_formats if (fmt.get("height") or 0) == height)
                 selected.append(
                     FormatDTO(
                         format_id=str(item.get("format_id") or f"{height}p"),
@@ -258,9 +254,7 @@ class VideoDownloader:
         elif not audio_formats:
             # A direct media URL exposes no per-format metadata, so offer one
             # honest option instead of inventing two resolutions.
-            selected.append(
-                FormatDTO(format_id="best", label="原始文件", ext="mp4", size_mb=0.0)
-            )
+            selected.append(FormatDTO(format_id="best", label="原始文件", ext="mp4", size_mb=0.0))
 
         # The audio option always uses the selector "mp3", never the raw yt-dlp
         # audio format id: a raw id (e.g. "140") would be treated as a video
@@ -366,8 +360,10 @@ class VideoDownloader:
             "--no-warnings",
             "--no-progress",
             "--newline",
-            "-f", selector,
-            "-o", template,
+            "-f",
+            selector,
+            "-o",
+            template,
         ]
         if audio_only:
             cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]

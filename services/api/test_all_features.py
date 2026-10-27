@@ -48,11 +48,7 @@ print_header("TEST 2: 视频解析 API")
 
 try:
     test_url = "https://www.bilibili.com/video/BV1xx411c7mD"
-    response = httpx.post(
-        f"{BASE_URL}/api/parse",
-        json={"url": test_url},
-        timeout=30
-    )
+    response = httpx.post(f"{BASE_URL}/api/parse", json={"url": test_url}, timeout=30)
 
     if response.status_code == 200:
         data = response.json()
@@ -62,8 +58,7 @@ try:
         formats_count = len(data.get("formats", []))
 
         details = (
-            f"标题: {title[:30]}... | 来源: {source} | "
-            f"时长: {duration}s | 格式: {formats_count}种"
+            f"标题: {title[:30]}... | 来源: {source} | 时长: {duration}s | 格式: {formats_count}种"
         )
         test_result("视频解析接口", True, details)
     else:
@@ -82,7 +77,7 @@ try:
     response = httpx.post(
         f"{BASE_URL}/api/tasks/download",
         json={"parse_id": "test_parse_001", "format_id": "1080p"},
-        timeout=10
+        timeout=10,
     )
 
     if response.status_code == 200:
@@ -132,7 +127,7 @@ try:
             input_path=test_image_path,
             mask_regions=mask_regions,
             output_path=output_path,
-            mode="standard"
+            mode="standard",
         )
 
         if os.path.exists(output_path):
@@ -159,9 +154,9 @@ try:
         json={
             "source_task_id": "test_source_001",
             "mask_regions": [{"x": 10, "y": 10, "w": 100, "h": 50}],
-            "mode": "standard"
+            "mode": "standard",
         },
-        timeout=10
+        timeout=10,
     )
 
     if response.status_code == 200:
@@ -204,9 +199,9 @@ try:
         json={
             "category": "功能建议",
             "description": "测试反馈内容，希望增加更多功能",
-            "contact": "test@example.com"
+            "contact": "test@example.com",
         },
-        timeout=10
+        timeout=10,
     )
 
     if response.status_code == 200:
@@ -231,11 +226,7 @@ try:
     if os.path.exists(test_image_path):
         with open(test_image_path, "rb") as f:
             files = {"file": ("test_image.jpg", f, "image/jpeg")}
-            response = httpx.post(
-                f"{BASE_URL}/api/tasks/watermark",
-                files=files,
-                timeout=30
-            )
+            response = httpx.post(f"{BASE_URL}/api/tasks/watermark", files=files, timeout=30)
 
         if response.status_code == 200:
             data = response.json()
@@ -276,7 +267,7 @@ total = len(test_results)
 print(f"总测试数: {total}")
 print(f"通过: {passed}")
 print(f"失败: {total - passed}")
-print(f"通过率: {passed/total*100:.1f}%")
+print(f"通过率: {passed / total * 100:.1f}%")
 print()
 
 print("详细结果:")
