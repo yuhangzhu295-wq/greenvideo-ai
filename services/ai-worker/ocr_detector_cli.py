@@ -11,6 +11,7 @@ import numpy as np
 PLATFORM_KEYWORDS = (
     "抖音", "快手", "小红书", "视频号", "微博", "bilibili",
     "douyin", "kuaishou", "tiktok", "搜索", "全屋定制",
+    "豆包", "剪映", "ai生成", "生成", "水印",
     "号", "id", "q ", "○"
 )
 
@@ -82,14 +83,14 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
                 # Logo icon is typically to the left of the platform text (e.g. Douyin 'd' note).
                 # Expand left only when adjacent to the platform logo header; for normal text lines,
                 # use tight padding so dark frame borders (like sky) are preserved for inpainting context.
-                is_logo_header = any(k in txt_lower for k in ("抖音", "快手", "小红书", "bilibili")) or len(txt) <= 3
+                is_logo_header = any(k in txt_lower for k in ("抖音", "快手", "小红书", "bilibili", "douyin", "kuaishou"))
                 if is_logo_header:
                     pad_left = max(int(bh * 1.35), int(bw * 0.25))
                 else:
-                    pad_left = max(6, int(bh * 0.35))
-                pad_top = max(6, int(bh * 0.25))
-                pad_right = max(8, int(bh * 0.35))
-                pad_bot = max(8, int(bh * 0.35))
+                    pad_left = max(6, min(int(bh * 0.35), 12))
+                pad_top = max(6, min(int(bh * 0.25), 8))
+                pad_right = max(8, min(int(bh * 0.35), 14))
+                pad_bot = max(8, min(int(bh * 0.35), 14))
                 
                 fx1 = max(0, bx1 - pad_left)
                 fy1 = max(0, by1 - pad_top)
@@ -118,7 +119,7 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
             inter = inter_x * inter_y
             u = w * h + cw * ch - inter
             if (inter / u > 0.2) or (abs(x - cx) < width * 0.12 and abs(y - cy) < height * 0.12):
-                c["box"] = (min(x, cx), min(y, cy), max(x + w, cx + cw) - min(x, cx), max(y + h, cy + ch) - min(y, cy))
+                c["member_boxes"].append((x, y, w, h))
                 c["times"].append(t_sec)
                 c["texts"].append(cand["text"])
                 c["scores"].append(cand["score"])
@@ -127,17 +128,33 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
         if not matched:
             clusters.append({
                 "box": (x, y, w, h),
+                "member_boxes": [(x, y, w, h)],
                 "times": [t_sec],
                 "texts": [cand["text"]],
                 "scores": [cand["score"]]
             })
             
     # Keep clusters with persistent presence (seen in at least 2 sampled frames)
-    # and not spanning huge areas
+    # and not spanning huge areas.
+    # Use the median of member boxes so occasional single-frame noise does not
+    # distort the true watermark extent.
     results = []
     for c in clusters:
         if len(c["times"]) >= 2:
-            bx, by, bw, bh = c["box"]
+            # A watermark block in a corner frequently contains multiple vertically
+            # stacked text lines (e.g. logo line + ID line + search line). The
+            # overall envelope must bound all lines in that corner cluster.
+            m_xs = [b[0] for b in c["member_boxes"]]
+            m_ys = [b[1] for b in c["member_boxes"]]
+            m_x2s = [b[0] + b[2] for b in c["member_boxes"]]
+            m_y2s = [b[1] + b[3] for b in c["member_boxes"]]
+            bx = int(np.min(m_xs))
+            by = int(np.min(m_ys))
+            bx2 = int(np.max(m_x2s))
+            by2 = int(np.max(m_y2s))
+            bw = bx2 - bx
+            bh = by2 - by
+            
             # Max area sanity check: a watermark should not exceed 8% of the frame
             if (bw * bh) > (width * height * 0.08):
                 continue

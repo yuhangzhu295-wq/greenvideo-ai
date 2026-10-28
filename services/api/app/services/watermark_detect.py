@@ -460,6 +460,68 @@ def detect_watermarks(
     )
 
 
+def _split_active_intervals(
+    timestamps: list[float],
+    vars_arr: list[float] | np.ndarray,
+    max_dur: float,
+    gap_threshold: float = 0.6,
+    min_active_dur: float = 0.8,
+    pre_roll: float = 0.35,
+    post_roll: float = 0.25,
+) -> list[tuple[float, float]]:
+    """Segment multiple active bursts of a watermark separated by inactive gaps.
+
+    In modern video platforms (Douyin, 豆包, Kuaishou), watermarks frequently
+    alternate across corners (e.g. bottom-right for 3s, then top-left for 4s,
+    then back to bottom-right).
+
+    Two critical edge constraints:
+    1. Fade-in coverage: platform watermarks fade in with 0.3s~0.5s animation.
+       Using a generous pre_roll (0.35s / ~9 frames) ensures that early semi-
+       transparent frames before the gradient variance spikes are fully covered,
+       preventing lingering faint text artifacts.
+    2. False positive rejection: transient texture spikes (ground rocks, camera
+       shake, lighting flicker) often produce brief variance blips lasting under
+       0.5s. Enforcing min_active_dur = 0.8s (unless at the very start or end
+       of the clip) cleanly discards non-watermark glitches.
+    """
+    arr = np.array(vars_arr)
+    if len(arr) == 0:
+        return []
+    max_v = float(arr.max())
+    thr = max(80.0, min(150.0, max_v * 0.20))
+    active = arr >= thr
+    raw_intervals: list[tuple[float, float]] = []
+    in_interval = False
+    start_t, last_t = 0.0, 0.0
+    for t, is_act in zip(timestamps, active, strict=False):
+        if is_act:
+            if not in_interval:
+                in_interval = True
+                start_t = t
+            last_t = t
+        else:
+            if in_interval and (t - last_t) >= gap_threshold:
+                raw_intervals.append((start_t, last_t))
+                in_interval = False
+    if in_interval:
+        raw_intervals.append((start_t, last_t))
+
+    filtered: list[tuple[float, float]] = []
+    for st, lt in raw_intervals:
+        dur = lt - st
+        is_video_tail = lt >= (max_dur - 0.5)
+        is_video_head = st <= 0.25
+        # Discard transient texture spikes that last less than a genuine watermark
+        if dur < min_active_dur and not is_video_tail and not is_video_head:
+            continue
+        s = max(0.0, st - pre_roll)
+        e = min(max_dur, lt + post_roll)
+        filtered.append((round(float(s), 2), round(float(e), 2)))
+
+    return filtered
+
+
 def detect_outro_cut(video_path: Path | str) -> tuple[int | None, float | None]:
     """Detect if the video ends with a platform promo outro (e.g. Douyin outro).
 
@@ -569,7 +631,7 @@ def detect_timed_watermarks_hybrid(video_path: Path | str) -> DetectionResult:
 
     if ocr_boxes:
         cap = cv2.VideoCapture(str(video_path))
-        sample_step = max(1, int(fps * 0.25))
+        sample_step = max(1, int(fps * 0.1))
         timestamps = []
         patch_vars: dict[int, list[float]] = {i: [] for i in range(len(ocr_boxes))}
 
@@ -593,23 +655,19 @@ def detect_timed_watermarks_hybrid(video_path: Path | str) -> DetectionResult:
             vars_arr = np.array(patch_vars[i])
             if len(vars_arr) == 0:
                 continue
-            med_var = float(np.median(vars_arr))
-            max_var = float(np.max(vars_arr))
-            thr = max(200.0, med_var * 0.7 if med_var > 300.0 else max_var * 0.35)
-            active_indices = np.where(vars_arr >= thr)[0]
-            if len(active_indices) >= 2:
-                start_s = max(0.0, timestamps[active_indices[0]] - 0.2)
-                end_s = min(content_dur, timestamps[active_indices[-1]] + 0.35)
-                bx, by, bw, bh = (int(v) for v in b["box"])
+            intervals = _split_active_intervals(timestamps, vars_arr, content_dur)
+            bx, by, bw, bh = (int(v) for v in b["box"])
+            for start_s, end_s in intervals:
                 det = Detection(
                     box=(bx, by, bw, bh),
                     area=bw * bh,
                     score=float(b.get("confidence", 0.95)),
                     kind="text",
-                    start_s=round(float(start_s), 2),
-                    end_s=round(float(end_s), 2),
+                    start_s=start_s,
+                    end_s=end_s,
                 )
                 detections.append(det)
+            if intervals:
                 cv2.rectangle(static_mask, (bx, by), (bx + bw, by + bh), 255, -1)
 
         if detections:
