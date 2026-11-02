@@ -1556,7 +1556,7 @@ def detect_timed_watermarks_hybrid(video_path: Path | str) -> DetectionResult:
             # variance flag and periodic drift that revisits the same spot at
             # the coarse interval (variance 0, invisible to passive checks).
             if dense_cache is None:
-                dense_cache = _dense_ocr_sightings(video_path, fps, content_end_frame, interval_s=0.2)
+                dense_cache = _dense_ocr_sightings(video_path, fps, content_end_frame, interval_s=0.35)
             moving_dets = _sightings_to_moving_detections(
                 dense_cache, target_texts, fps, content_end_frame
             )

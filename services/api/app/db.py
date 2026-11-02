@@ -209,6 +209,24 @@ def get_task(task_id: str) -> Task | None:
         return session.get(Task, task_id)
 
 
+def fail_stale_running_tasks(reason: str) -> int:
+    """Mark tasks stuck in queued/processing from a previous run as failed.
+
+    The backend runs tasks in-process; after a restart nothing resumes them, so
+    leaving them queued/processing would hang the user's UI forever.
+    """
+    changed = 0
+    with get_session() as session:
+        statement = select(Task).where(Task.status.in_(["queued", "processing"]))
+        for task in session.exec(statement):
+            task.status = "failed"
+            task.stage = "服务重启，任务中断"
+            task.error = reason
+            task.updated_at = utc_now()
+            changed += 1
+    return changed
+
+
 def delete_task(task_id: str) -> bool:
     with get_session() as session:
         task = session.get(Task, task_id)

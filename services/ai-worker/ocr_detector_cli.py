@@ -57,17 +57,19 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
         ret, frame = cap.read()
         if not ret: break
 
-        # Semi-transparent watermarks on dark backgrounds (cave, night sky)
-        # fall below OCR's contrast floor. A CLAHE-enhanced pass recovers them;
-        # both passes feed the same candidate pool, duplicates merge later.
-        frames_to_ocr = [frame]
-        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-        lab[..., 0] = clahe.apply(lab[..., 0])
-        frames_to_ocr.append(cv2.cvtColor(lab, cv2.COLOR_LAB2BGR))
+        # OCR accuracy on watermark text holds at long-edge ~960, and PaddleOCR
+        # cost scales with pixel count: downscaling large frames cuts the dense
+        # scan (the dominant detection cost) roughly in half. Boxes are mapped
+        # back to full-frame coordinates below via ocr_scale.
+        ocr_scale = 1.0
+        if max(frame.shape[:2]) > 960:
+            ocr_scale = 960.0 / max(frame.shape[:2])
+            frame = cv2.resize(frame, None, fx=ocr_scale, fy=ocr_scale, interpolation=cv2.INTER_AREA)
 
-        for frame_variant in frames_to_ocr:
-            res = ocr.predict(frame_variant)
+        def _collect(img, out_list):
+            """Run one OCR pass and append surviving candidates to out_list."""
+            res = ocr.predict(img)
+            inv = 1.0 / ocr_scale
             for r in res:
                 texts = r.get("rec_texts")
                 scores = r.get("rec_scores")
@@ -76,7 +78,13 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
                     continue
                 for txt, sc, b in zip(texts, scores, boxes):
                     if sc < 0.5: continue
-                    bx1, by1, bx2, by2 = int(b[0]), int(b[1]), int(b[2]), int(b[3])
+                    # Map boxes from the downscaled OCR frame back to full-frame
+                    # pixels; all padding/safety math below runs in full-frame
+                    # coordinates.
+                    bx1 = int(b[0] * inv)
+                    by1 = int(b[1] * inv)
+                    bx2 = int(b[2] * inv)
+                    by2 = int(b[3] * inv)
                     bw, bh = bx2 - bx1, by2 - by1
                     if bw <= 0 or bh <= 0: continue
 
@@ -124,12 +132,26 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
                         fy1 = max(0, by1 - max(pad_top, int(bh * 0.50)))
                         fy2 = min(height, by2 + max(pad_bot, int(bh * 0.50)))
 
-                    raw_candidates.append({
+                    out_list.append({
                         "time_s": t_sec,
                         "box": (fx1, fy1, fx2 - fx1, fy2 - fy1),
                         "text": txt,
                         "score": float(sc)
                     })
+
+        # First pass on the original frame. The CLAHE-enhanced second pass costs
+        # one extra full OCR inference per frame; it is only worth running when
+        # the original pass found nothing usable (dark cave / night-sky
+        # backgrounds push semi-transparent text below the contrast floor).
+        frame_hits = 0
+        before = len(raw_candidates)
+        _collect(frame, raw_candidates)
+        frame_hits = len(raw_candidates) - before
+        if frame_hits == 0:
+            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+            lab[..., 0] = clahe.apply(lab[..., 0])
+            _collect(cv2.cvtColor(lab, cv2.COLOR_LAB2BGR), raw_candidates)
                 
     cap.release()
 

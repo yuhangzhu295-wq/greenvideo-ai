@@ -19,6 +19,7 @@ Guarantees enforced here
 from __future__ import annotations
 
 import base64
+import json
 import shutil
 import subprocess
 import tempfile
@@ -95,6 +96,82 @@ def _ensure_model() -> None:
         raise AiServiceError(f"切换 IOPaint 模型返回 {response.status_code}: {response.text[:200]}")
 
 
+class LamaWorker:
+    """Persistent LaMa process (ai-worker venv: torch+CUDA) over stdin/stdout.
+
+    Calling IOPaint over HTTP costs hundreds of milliseconds of PNG/base64 and
+    Python pipeline overhead per frame while the GPU forward itself takes tens
+    of milliseconds. This worker loads the model once and serves crops over a
+    pipe. Falls back to HTTP IOPaint when the worker cannot start.
+    """
+
+    _worker_script = (
+        Path(__file__).resolve().parent.parent.parent.parent
+        / "ai-worker" / "lama_worker.py"
+    )
+    _worker_python = (
+        Path(__file__).resolve().parent.parent.parent.parent
+        / "ai-worker" / ".venv" / "Scripts" / "python.exe"
+    )
+
+    def __init__(self) -> None:
+        self._proc: subprocess.Popen | None = None
+
+    def start(self) -> None:
+        if not (self._worker_script.exists() and self._worker_python.exists()):
+            raise AiServiceError("LaMa worker 脚本或 ai-worker 解释器不存在")
+        self._proc = subprocess.Popen(
+            [str(self._worker_python), str(self._worker_script)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            cwd=str(self._worker_script.parent),
+        )
+        # The worker prints a ready line once the model is on the device.
+        ready_line = self._proc.stdout.readline()
+        ready = json.loads(ready_line.strip() or "{}")
+        if not ready.get("ready"):
+            self.stop()
+            raise AiServiceError(f"LaMa worker 启动失败：{ready}")
+
+    def inpaint(self, frame, mask):
+        import cv2
+        import numpy as np
+
+        ok, img_buf = cv2.imencode(".png", frame)
+        ok2, mask_buf = cv2.imencode(".png", mask)
+        if not (ok and ok2):
+            raise AiServiceError("帧或 mask 编码失败")
+        req = json.dumps({
+            "image": base64.b64encode(img_buf.tobytes()).decode("ascii"),
+            "mask": base64.b64encode(mask_buf.tobytes()).decode("ascii"),
+        })
+        self._proc.stdin.write(req + "\n")
+        self._proc.stdin.flush()
+        line = self._proc.stdout.readline()
+        if not line:
+            raise AiServiceError("LaMa worker 已退出")
+        resp = json.loads(line.strip())
+        if "image" not in resp:
+            raise AiServiceError(f"LaMa worker 推理失败：{resp.get('error')}")
+        arr = np.frombuffer(base64.b64decode(resp["image"]), dtype=np.uint8)
+        out = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if out is None or out.shape != frame.shape:
+            raise AiServiceError("LaMa worker 返回尺寸不符")
+        return out
+
+    def stop(self) -> None:
+        if self._proc is not None:
+            try:
+                self._proc.stdin.close()
+                self._proc.wait(timeout=10)
+            except Exception:
+                self._proc.kill()
+            self._proc = None
+
+
 def _inpaint_frame(
     frame,
     mask,
@@ -102,26 +179,50 @@ def _inpaint_frame(
     base: str,
     max_attempts: int = 3,
 ):
+    """Inpaint only the masked region via IOPaint, pasted back into the full frame.
+
+    Performance: sending the full 1080p frame costs seconds of PNG/base64
+    encoding per request. Cropping to the mask bounding rect (+ margin) cuts
+    the payload to a fraction and lets LaMa run on a much smaller tensor.
+    """
     import cv2
     import numpy as np
 
-    ok, img_buf = cv2.imencode(".png", frame)
-    ok2, mask_buf = cv2.imencode(".png", mask)
+    ys, xs = np.where(mask > 0)
+    if ys.size == 0:
+        return frame
+
+    height, width = frame.shape[:2]
+    margin = 96
+    x0 = max(0, int(xs.min()) - margin)
+    y0 = max(0, int(ys.min()) - margin)
+    x1 = min(width, int(xs.max()) + margin)
+    y1 = min(height, int(ys.max()) + margin)
+    # Align to multiples of 8: friendlier to the model's downsampling.
+    x0 -= x0 % 8
+    y0 -= y0 % 8
+    x1 += (8 - x1 % 8) % 8
+    y1 += (8 - y1 % 8) % 8
+    x1 = min(x1, width)
+    y1 = min(y1, height)
+
+    frame_crop = frame[y0:y1, x0:x1]
+    mask_crop = mask[y0:y1, x0:x1]
+
+    ok, img_buf = cv2.imencode(".png", frame_crop)
+    ok2, mask_buf = cv2.imencode(".png", mask_crop)
     if not (ok and ok2):
         raise AiServiceError("帧或 mask 编码失败")
 
     payload = {
         "image": base64.b64encode(img_buf.tobytes()).decode("ascii"),
         "mask": base64.b64encode(mask_buf.tobytes()).decode("ascii"),
-        "ldm_steps": 20,
-        "hd_strategy": "Crop",
-        "hd_strategy_crop_margin": 128,
-        "hd_strategy_crop_trigger_size": 800,
-        "hd_strategy_resize_limit": 1280,
+        "hd_strategy": "Original",
         "sd_keep_unmasked_area": True,
     }
 
     last_error = ""
+    inpainted_crop = None
     for _attempt in range(max_attempts):
         try:
             response = client.post(f"{base}/api/v1/inpaint", json=payload, timeout=300)
@@ -140,11 +241,20 @@ def _inpaint_frame(
         if out is None:
             last_error = "响应图片解码失败"
             continue
-        if out.shape != frame.shape:
-            last_error = f"返回尺寸不符 {out.shape} != {frame.shape}"
+        if out.shape != frame_crop.shape:
+            last_error = f"返回尺寸不符 {out.shape} != {frame_crop.shape}"
             continue
-        return out
-    raise AiServiceError(f"LaMa 推理失败（重试 {max_attempts} 次）：{last_error}")
+        inpainted_crop = out
+        break
+    if inpainted_crop is None:
+        raise AiServiceError(f"LaMa 推理失败（重试 {max_attempts} 次）：{last_error}")
+
+    # Paste the repaired crop back; unmasked pixels of the crop are identical
+    # to the source (sd_keep_unmasked_area), so the rest of the frame stays
+    # byte-identical to the original.
+    out_frame = frame.copy()
+    out_frame[y0:y1, x0:x1] = inpainted_crop
+    return out_frame
 
 
 def _stream_info(probe: dict, kind: str) -> dict | None:
@@ -427,11 +537,21 @@ def repair_video(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    available, reason = iopaint_status()
-    if not available:
-        raise AiServiceError(f"AI 修复引擎不可用：{reason}")
+    # Prefer the persistent in-process worker (CUDA, model loaded once): it
+    # removes hundreds of milliseconds of HTTP/PNG overhead per frame and does
+    # not require the IOPaint HTTP server at all. HTTP IOPaint is the fallback.
+    worker = LamaWorker()
+    try:
+        worker.start()
+    except AiServiceError as exc:
+        print(f"[repair] LaMa worker unavailable, trying HTTP IOPaint: {exc}")
+        worker = None
 
-    _ensure_model()
+    if worker is None:
+        available, reason = iopaint_status()
+        if not available:
+            raise AiServiceError(f"AI 修复引擎不可用：{reason}")
+        _ensure_model()
     base = settings.iopaint_base_url.rstrip("/")
 
     report = RepairReport(engine=f"iopaint-lama:{settings.iopaint_model}")
@@ -517,7 +637,10 @@ def repair_video(
                     prev_inpainted = None
                     prev_mask = None
                 else:
-                    inpainted = _inpaint_frame(frame, mask, client, base)
+                    if worker is not None:
+                        inpainted = worker.inpaint(frame, mask)
+                    else:
+                        inpainted = _inpaint_frame(frame, mask, client, base)
 
                     # 1. Dilate mask with (9, 9) ellipse, then feather with GaussianBlur.
                     # Core mask ensures unfeathered center has 100% alpha = 1.0 (no leakage).
@@ -745,4 +868,6 @@ def repair_video(
     )
     report.notes.append(f"平均遮罩覆盖率 {report.mask_coverage_pct}%")
     report.notes.append(f"音频保留：{report.audio_preserved}")
+    if worker is not None:
+        worker.stop()
     return report

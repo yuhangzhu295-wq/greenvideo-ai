@@ -67,6 +67,13 @@ def health_payload() -> dict:
 def create_app() -> FastAPI:
     ensure_storage()
     init_db()
+    # Tasks run in-process; after a restart nothing resumes them, so a stale
+    # queued/processing row would hang the user's UI forever.
+    from app.db import fail_stale_running_tasks
+
+    stale = fail_stale_running_tasks("服务重启，未完成任务已中断，请重新提交。")
+    if stale:
+        print(f"[startup] marked {stale} stale queued/processing task(s) as failed")
     static_dir = settings.storage_dir / "static"
     _ensure_demo_thumb(static_dir)
 

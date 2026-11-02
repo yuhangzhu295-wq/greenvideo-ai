@@ -45,6 +45,10 @@ AUTO_DETECT_MAX_COVERAGE_PCT = 15.0
 # legitimately select a wide band), but still bounded so a mistake cannot mask
 # the whole frame.
 MANUAL_MAX_COVERAGE_PCT = 60.0
+# LaMa and PaddleOCR both saturate the CPU/GPU: letting two videos run at once
+# makes each one slower without raising total throughput. One heavy task at a
+# time keeps per-task latency predictable; extra tasks queue visibly.
+HEAVY_TASK_GATE = asyncio.Semaphore(1)
 
 
 def _eta(progress: int) -> int:
@@ -450,6 +454,19 @@ async def _run_watermark_task(
     # object between concurrent tasks let one task's failure be overwritten by
     # another's success before it was read.
     processor = WatermarkProcessor()
+    # One heavy task at a time: LaMa and PaddleOCR both saturate the machine,
+    # so concurrent videos would only slow each other down. Queued tasks keep
+    # their "queued" status until the gate opens.
+    async with HEAVY_TASK_GATE:
+        await _run_watermark_task_locked(task_id, payload, source_path, processor)
+
+
+async def _run_watermark_task_locked(
+    task_id: str,
+    payload: WatermarkTaskRequest,
+    source_path: Path | None,
+    processor: WatermarkProcessor,
+) -> None:
     try:
         _safe_stage(task_id, 8, "准备素材")
         await asyncio.sleep(0.05)
