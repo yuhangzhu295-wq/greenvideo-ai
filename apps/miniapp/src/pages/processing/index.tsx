@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Button, Text, View } from "@tarojs/components";
+import { Button, Text, View, Video } from "@tarojs/components";
 import Taro from "@tarojs/taro";
 import { cancelTask, getTask, toAbsoluteUrl } from "@/api/client";
 import type { TaskStatus } from "@/api/types";
@@ -83,6 +83,7 @@ async function saveToAlbumOrLocal(tempFilePath: string, url: string) {
 export default function ProcessingPage() {
   const [task, setTask] = useState<TaskStatus>(initialTask);
   const [error, setError] = useState("");
+  const [tab, setTab] = useState<"tracking" | "result" | "progress">("tracking");
 
   useEffect(() => {
     const taskId = String(Taro.getCurrentInstance().router?.params?.taskId || "");
@@ -159,11 +160,67 @@ export default function ProcessingPage() {
 
       <Card className='processing-card'>
         <SectionTitle title={task.type === "download" ? "正在生成下载文件" : "正在智能去水印"} />
-        <View className='processing-preview'>
-          <View className='quality-pill'>{task.type === "download" ? "DL" : "1080P"}</View>
-          <ProgressRing progress={task.progress} label={progressLabel} />
-          <View className='video-time'>▶ {task.stage}</View>
-        </View>
+
+        {task.tracking_preview_url || (isDone(task) && task.download_url) ? (
+          <View className='preview-tabs'>
+            {task.tracking_preview_url && (
+              <View
+                className={`preview-tab-btn ${tab === "tracking" ? "active" : ""}`}
+                onClick={() => setTab("tracking")}
+              >
+                🎯 动态追踪标记
+              </View>
+            )}
+            {isDone(task) && task.download_url && (
+              <View
+                className={`preview-tab-btn ${tab === "result" ? "active" : ""}`}
+                onClick={() => setTab("result")}
+              >
+                ✨ 修复后成片
+              </View>
+            )}
+            <View
+              className={`preview-tab-btn ${tab === "progress" ? "active" : ""}`}
+              onClick={() => setTab("progress")}
+            >
+              📊 处理进度
+            </View>
+          </View>
+        ) : null}
+
+        {tab === "tracking" && task.tracking_preview_url ? (
+          <View className='tracking-video-container'>
+            <Video
+              src={toAbsoluteUrl(task.tracking_preview_url)}
+              className='tracking-video-player'
+              autoplay
+              loop
+              muted
+              controls
+            />
+            <View className='tracking-tag-overlay'>
+              <Text className='live-dot'>●</Text> 动态追踪中 · 绿色框实时锁定
+            </View>
+          </View>
+        ) : tab === "result" && isDone(task) && task.download_url ? (
+          <View className='tracking-video-container'>
+            <Video
+              src={toAbsoluteUrl(task.download_url)}
+              className='tracking-video-player'
+              autoplay
+              controls
+            />
+            <View className='tracking-tag-overlay done'>
+              ✓ AI 无损修复完成 · 纯净无损
+            </View>
+          </View>
+        ) : (
+          <View className='processing-preview'>
+            <View className='quality-pill'>{task.type === "download" ? "DL" : "1080P"}</View>
+            <ProgressRing progress={task.progress} label={progressLabel} />
+            <View className='video-time'>▶ {task.stage}</View>
+          </View>
+        )}
 
         <View className='process-list'>
           <View className='process-line'>

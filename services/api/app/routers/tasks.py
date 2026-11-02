@@ -141,6 +141,22 @@ def _probe_frame_size(path: Path) -> tuple[int, int]:
         return 0, 0
 
 
+def _probe_fps(path: Path) -> float:
+    """FPS of a video's first stream, or 25.0 when unknown."""
+    try:
+        import cv2
+
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            cap.release()
+            return 25.0
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        cap.release()
+        return fps if fps > 0 else 25.0
+    except Exception:
+        return 25.0
+
+
 def _region_coverage_pct(regions: list[MaskRegion], width: int = 0, height: int = 0) -> float:
     """Share of the frame covered by the union of the given regions."""
     if not regions:
@@ -449,6 +465,7 @@ async def _run_watermark_task(
         target_max_frames: int | None = None
         mask_preset = payload.mask_preset
         frame_width = frame_height = 0
+        detection = None
         # Auto-detection and hand-picked time-scoped regions describe the same
         # thing (where to repair) in two different ways. Allowing both lets the
         # detector's result be gated while the submitted regions - which the
@@ -537,10 +554,48 @@ async def _run_watermark_task(
                 update_history_by_task(task_id, status="failed")
                 return
 
+            # Generate tracking preview video and sample frame_tracks JSON
+            tracks_json = []
+            tracking_ready = False
+            if getattr(detection, "frame_tracks", None):
+                preview_dest = storage_path("files", f"tracking_{task_id}.mp4")
+                try:
+                    from app.services.watermark_detect import render_tracking_preview_video
+
+                    await asyncio.to_thread(
+                        render_tracking_preview_video,
+                        source_path,
+                        detection.frame_tracks,
+                        preview_dest,
+                        target_max_frames,
+                    )
+                    tracking_ready = preview_dest.exists() and preview_dest.stat().st_size > 0
+                except Exception as exc:
+                    logging.getLogger(__name__).warning("Failed to render tracking preview: %s", exc)
+
+                sample_s = max(1, len(detection.frame_tracks) // 60)
+                for rec in detection.frame_tracks[::sample_s]:
+                    tracks_json.append(
+                        {
+                            "frame_index": rec.frame_index,
+                            "timestamp_s": rec.timestamp_s,
+                            "boxes": [
+                                {
+                                    "track_id": tb.track_id,
+                                    "box": list(tb.box),
+                                    "kind": tb.kind,
+                                    "confidence": tb.confidence,
+                                    "keypoints": tb.keypoints[:6],
+                                }
+                                for tb in rec.boxes
+                            ],
+                        }
+                    )
+
             _safe_stage(
                 task_id,
                 16,
-                f"已自动检测到 {len(effective_timed_regions or mask_regions)} 个水印区域"
+                f"已自动检测并追踪 {len(effective_timed_regions or mask_regions)} 个水印轨迹"
                 f"（覆盖 {coverage_pct:.1f}% 画面），开始修复",
             )
             # Record what the detector actually produced so the run can be
@@ -557,6 +612,11 @@ async def _run_watermark_task(
                     "auto_detect_regions": audit_regions,
                     "source_path": str(source_path) if source_path else None,
                     "outro_cut_frame": target_max_frames,
+                    "tracking_preview_ready": tracking_ready,
+                    "source_url_ready": bool(source_path and source_path.exists()),
+                    "frame_tracks": tracks_json,
+                    "video_width": frame_width,
+                    "video_height": frame_height,
                 },
             )
 
@@ -624,6 +684,7 @@ async def _run_watermark_task(
                 is_canceled,
                 effective_timed_regions,
                 target_max_frames,
+                getattr(detection, "frame_tracks", None) if "detection" in locals() and detection else None,
             )
             engine = processor.last_engine
             engine_note = processor.last_engine_note
@@ -652,6 +713,43 @@ async def _run_watermark_task(
             )
             update_history_by_task(task_id, status="failed")
             return
+
+        # Post-repair residual gate: template-match every tracked watermark
+        # patch against the repaired video. A repair that missed its target is
+        # a failed task, never a completed file with the watermark still on it.
+        if suffix in VIDEO_EXT and detection is not None and getattr(detection, "detections", None):
+            _safe_stage(task_id, 92, "修复残留校验中")
+            from app.services.watermark_detect import verify_watermark_removal
+
+            verify = await asyncio.to_thread(
+                verify_watermark_removal,
+                source_path,
+                output,
+                detection.detections,
+                _probe_fps(source_path),
+                target_max_frames,
+            )
+            if not verify.get("ok") and verify.get("residual_ratio", 1.0) > 0.05:
+                update_task(
+                    task_id,
+                    status="failed",
+                    progress=100,
+                    stage="水印残留校验未通过",
+                    error=(
+                        f"修复后仍有 {verify['residual_count']}/{verify['total']} 个抽检点检出水印残留"
+                        f"（比例 {verify['residual_ratio']:.0%}），任务已标记失败而非交付残留成片。"
+                        f"残留样例：{verify['residual'][:5]}"
+                    ),
+                    output_path=str(output),
+                )
+                update_history_by_task(task_id, status="failed")
+                return
+            if not verify.get("ok"):
+                _safe_stage(
+                    task_id,
+                    95,
+                    f"残留校验：{verify['residual_count']}/{verify['total']} 个抽检点轻微残留（≤5%），已交付",
+                )
 
         update_task(
             task_id,
@@ -739,6 +837,25 @@ def get_task_status(task_id: str) -> TaskStatusDTO:
     if status in {"completed", "success"}:
         download_url = f"/api/files/{task_id}"
 
+    task_input = {}
+    if getattr(task, "input_json", None):
+        try:
+            task_input = json.loads(task.input_json)
+        except Exception:
+            task_input = {}
+
+    tracking_preview_url = None
+    if task_input.get("tracking_preview_ready"):
+        tracking_preview_url = f"/api/files/{task_id}/tracking"
+
+    source_video_url = None
+    if task_input.get("source_url_ready"):
+        source_video_url = f"/api/files/{task_id}/source"
+
+    frame_tracks = task_input.get("frame_tracks")
+    video_width = task_input.get("video_width")
+    video_height = task_input.get("video_height")
+
     return TaskStatusDTO(
         task_id=task.id,
         type=task.type,
@@ -747,6 +864,11 @@ def get_task_status(task_id: str) -> TaskStatusDTO:
         stage=task.stage,
         eta_seconds=_eta(progress),
         download_url=download_url,
+        tracking_preview_url=tracking_preview_url,
+        source_video_url=source_video_url,
+        frame_tracks=frame_tracks,
+        video_width=video_width,
+        video_height=video_height,
         error=task.error,
     )
 

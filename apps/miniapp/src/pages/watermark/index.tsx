@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { Button, Input, Text, View } from "@tarojs/components";
+import { Button, Input, Text, View, Video } from "@tarojs/components";
 import Taro from "@tarojs/taro";
 import { parseVideo, uploadWatermarkFile } from "@/api/client";
 import type { WatermarkPayload } from "@/api/types";
@@ -162,11 +162,11 @@ export default function WatermarkPage() {
       Taro.showToast({ title: "请先确认素材授权", icon: "none" });
       return;
     }
-    if (endCardWatermark && !splitConfirmed) {
+    if (!autoDetect && endCardWatermark && !splitConfirmed) {
       Taro.showToast({ title: "请确认片尾开始时间", icon: "none" });
       return;
     }
-    if (endCardWatermark && !(Number(splitSeconds) > 0)) {
+    if (!autoDetect && endCardWatermark && !(Number(splitSeconds) > 0)) {
       Taro.showToast({ title: "请填写有效的片尾开始时间", icon: "none" });
       return;
     }
@@ -179,7 +179,7 @@ export default function WatermarkPage() {
         remove_subtitle: removeSubtitle,
         auto_detect: autoDetect,
         confirm_authorized: confirmed,
-        timed_mask_regions: endCardWatermark
+        timed_mask_regions: (!autoDetect && endCardWatermark)
           ? buildTimedRegions(preset, mediaSize, Number(splitSeconds) || 12)
           : []
       });
@@ -207,12 +207,25 @@ export default function WatermarkPage() {
           <View className='safe-pill'>AI 智能识别 · 精准去除</View>
         </View>
 
-        <View className='watermark-preview'>
-          <Text className='dash-label logo'>LOGO</Text>
-          <Text className='dash-label subtitle'>字幕文字</Text>
-          <Text className='dash-label corner'>角标</Text>
-          <Text className='center-play'>▶</Text>
-        </View>
+        {filePath ? (
+          <View className='watermark-video-wrapper'>
+            <Video
+              src={filePath}
+              className='watermark-video-player'
+              controls
+              autoplay={false}
+              showCenterPlayBtn
+            />
+            <View className='watermark-track-tag'>AI 逐帧追踪就绪</View>
+          </View>
+        ) : (
+          <View className='watermark-preview' onClick={chooseFile}>
+            <Text className='dash-label logo'>智能感知</Text>
+            <Text className='dash-label subtitle'>逐帧追踪</Text>
+            <Text className='dash-label corner'>角标/二维码</Text>
+            <Text className='center-play'>+ 选择素材</Text>
+          </View>
+        )}
 
         <SectionTitle title='选择水印位置' />
         <View className='preset-grid'>
@@ -253,20 +266,22 @@ export default function WatermarkPage() {
         <View className='toggle-row' onClick={() => setAutoDetect(!autoDetect)}>
           <Text className={`checkbox ${autoDetect ? "checked" : ""}`}>{autoDetect ? "✓" : ""}</Text>
           <View>
-            <View className='feature-title'>自动检测水印区域</View>
-            <View className='muted'>开启后忽略上方预设，由系统定位水印；检测不到会直接失败</View>
+            <View className='feature-title'>自动检测水印区域与片尾</View>
+            <View className='muted'>开启后智能定位水印与平台片尾；关闭后可使用手动预设</View>
           </View>
         </View>
 
-        <View className='toggle-row' onClick={() => { setEndCardWatermark(!endCardWatermark); setSplitConfirmed(false); }}>
-          <Text className={`checkbox ${endCardWatermark ? "checked" : ""}`}>{endCardWatermark ? "✓" : ""}</Text>
-          <View>
-            <View className='feature-title'>片尾也有水印</View>
-            <View className='muted'>视频末尾出现居中片尾水印时开启，将按时间段分别处理</View>
+        {!autoDetect && (
+          <View className='toggle-row' onClick={() => { setEndCardWatermark(!endCardWatermark); setSplitConfirmed(false); }}>
+            <Text className={`checkbox ${endCardWatermark ? "checked" : ""}`}>{endCardWatermark ? "✓" : ""}</Text>
+            <View>
+              <View className='feature-title'>手动设置片尾分时水印</View>
+              <View className='muted'>视频末尾出现居中片尾水印时开启，将按时间段分别处理</View>
+            </View>
           </View>
-        </View>
+        )}
 
-        {endCardWatermark && (
+        {!autoDetect && endCardWatermark && (
           <View className='toggle-row'>
             <View>
               <View className='feature-title'>片尾开始时间（秒）</View>

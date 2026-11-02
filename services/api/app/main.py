@@ -94,6 +94,12 @@ def create_app() -> FastAPI:
     def health() -> dict:
         return {"status": "ok", **health_payload()}
 
+    # Serve the built H5 app same-origin. MUST be registered last: a "/" mount
+    # matches every path and would shadow any route registered after it.
+    dist_h5 = Path(__file__).resolve().parent.parent.parent.parent / "apps" / "miniapp" / "dist"
+    if dist_h5.is_dir():
+        app.mount("/", StaticFiles(directory=dist_h5, html=True), name="h5")
+
     return app
 
 

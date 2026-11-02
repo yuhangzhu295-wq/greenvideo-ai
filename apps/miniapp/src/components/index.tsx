@@ -2,12 +2,10 @@ import React from "react";
 import { Button, Input, Picker, Text, Textarea, View } from "@tarojs/components";
 import Taro from "@tarojs/taro";
 
-type NavKey = "home" | "tools" | "profile";
+export type NavKey = "home" | "tools" | "profile";
 
 const navItems: Array<{ key: NavKey; label: string; icon: string; url: string }> = [
-  { key: "home", label: "首页", icon: "⌂", url: "/pages/home/index" },
-  { key: "tools", label: "工具", icon: "▦", url: "/pages/watermark/index" },
-  { key: "profile", label: "我的", icon: "◯", url: "/pages/profile/index" }
+  { key: "home", label: "视频去水印", icon: "▦", url: "/pages/home/index" }
 ];
 
 export function navigate(url: string) {

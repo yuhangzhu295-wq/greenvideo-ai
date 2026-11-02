@@ -50,6 +50,21 @@ export interface TaskStatus {
   stage: string;
   eta_seconds: number;
   download_url: string | null;
+  tracking_preview_url?: string | null;
+  source_video_url?: string | null;
+  frame_tracks?: Array<{
+    frame_index: number;
+    timestamp_s: number;
+    boxes: Array<{
+      track_id: string;
+      box: [number, number, number, number];
+      kind: string;
+      confidence: number;
+      keypoints?: Array<[number, number]>;
+    }>;
+  }> | null;
+  video_width?: number | null;
+  video_height?: number | null;
   error?: string | null;
 }
 

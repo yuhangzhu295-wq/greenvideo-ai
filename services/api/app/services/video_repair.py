@@ -488,6 +488,9 @@ def repair_video(
 
         with httpx.Client() as client:
             index = 0
+            prev_frame = None
+            prev_inpainted = None
+            prev_mask = None
             while True:
                 if cancel_check is not None and cancel_check():
                     cap.release()
@@ -510,17 +513,75 @@ def repair_video(
                 if coverage <= 0.0:
                     out_frame = frame
                     report.frames_skipped += 1
+                    prev_frame = frame
+                    prev_inpainted = None
+                    prev_mask = None
                 else:
                     inpainted = _inpaint_frame(frame, mask, client, base)
-                    # Contract requirement: unmasked pixels must remain 100% untouched.
-                    # Feather the mask edges (blur radius 5) to smoothly blend into the
-                    # original frame while ensuring unmasked areas are an exact copy.
-                    alpha = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (5, 5), 0)[..., None]
+
+                    # 1. Dilate mask with (9, 9) ellipse, then feather with GaussianBlur.
+                    # Core mask ensures unfeathered center has 100% alpha = 1.0 (no leakage).
+                    core_mask = (mask > 127).astype(np.float32)
+                    dilated = cv2.dilate(
+                        mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)), iterations=1
+                    )
+                    feathered = cv2.GaussianBlur(dilated.astype(np.float32) / 255.0, (11, 11), 0)
+                    alpha = np.maximum(core_mask, feathered)[..., None]
+
+                    # 2. Outer ring analysis for temporal smoothing & speck suppression
+                    ring = (cv2.dilate(dilated, np.ones((15, 15), np.uint8)) > 127) & (
+                        dilated <= 127
+                    )
+                    if ring.any():
+                        ring_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)[ring]
+                        ring_luma_mean = float(ring_gray.mean())
+                        ring_luma_std = float(ring_gray.std())
+
+                        # Dark background bright noise clamp (suppresses fake stars/flashes)
+                        if ring_luma_mean < 35.0 and ring_luma_std < 18.0:
+                            cap_val = np.percentile(frame[ring], 96, axis=0) + 4.0
+                            mask_bool = dilated > 127
+                            inpainted[mask_bool] = np.minimum(inpainted[mask_bool], cap_val).astype(
+                                np.uint8
+                            )
+
+                        # Frame-to-frame temporal smoothing (EMA)
+                        if (
+                            prev_inpainted is not None
+                            and prev_mask is not None
+                            and prev_frame is not None
+                        ):
+                            inter_m = np.logical_and(dilated > 127, prev_mask > 127).sum()
+                            union_m = np.logical_or(dilated > 127, prev_mask > 127).sum()
+                            mask_iou = inter_m / max(1, union_m)
+                            if mask_iou > 0.85:
+                                ring_diff = float(
+                                    np.abs(
+                                        frame[ring].astype(np.float32)
+                                        - prev_frame[ring].astype(np.float32)
+                                    ).mean()
+                                )
+                                if ring_diff < 3.5:
+                                    # Static or very slow background (night sky, wall)
+                                    inpainted = (
+                                        0.78 * prev_inpainted.astype(np.float32)
+                                        + 0.22 * inpainted.astype(np.float32)
+                                    ).astype(np.uint8)
+                                elif ring_diff < 10.0:
+                                    # Moderate motion: medium smoothing
+                                    inpainted = (
+                                        0.40 * prev_inpainted.astype(np.float32)
+                                        + 0.60 * inpainted.astype(np.float32)
+                                    ).astype(np.uint8)
+
                     out_frame = (
                         inpainted.astype(np.float32) * alpha
                         + frame.astype(np.float32) * (1.0 - alpha)
                     ).astype(np.uint8)
                     report.frames_repaired += 1
+                    prev_frame = frame
+                    prev_inpainted = inpainted
+                    prev_mask = dilated
 
                 # A frame that fails to land on disk would silently shorten the
                 # output. ffmpeg then encodes a video with fewer frames than the
@@ -564,7 +625,7 @@ def repair_video(
                 "-pix_fmt",
                 "yuv420p",
                 "-crf",
-                "18",
+                "16",
                 str(silent),
             ],
             capture_output=True,

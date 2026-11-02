@@ -181,6 +181,39 @@ class TimedMaskProvider:
         return mask
 
 
+class FrameTrajectoryMaskProvider:
+    """Build dense per-frame mask directly from optical flow tracking trajectories.
+
+    For every frame, reads the exact active bounding boxes from FrameTrackRecord
+    so the mask moves dynamically with the watermark instead of using static boxes.
+    """
+
+    def __init__(self, frame_tracks: list, height: int, width: int) -> None:
+        self.frame_tracks = list(frame_tracks)
+        self.height = height
+        self.width = width
+
+    def mask_for(self, index: int, frame):
+        import numpy as np
+
+        mask = np.zeros((self.height, self.width), dtype=np.uint8)
+        if 0 <= index < len(self.frame_tracks):
+            rec = self.frame_tracks[index]
+            boxes = getattr(rec, "boxes", []) or []
+            for tb in boxes:
+                b = getattr(tb, "box", None) or (tb.get("box") if isinstance(tb, dict) else None)
+                if not b:
+                    continue
+                bx, by, bw, bh = b
+                x1 = max(0, min(self.width, int(bx)))
+                y1 = max(0, min(self.height, int(by)))
+                x2 = max(0, min(self.width, int(bx + bw)))
+                y2 = max(0, min(self.height, int(by + bh)))
+                if x2 > x1 and y2 > y1:
+                    mask[y1:y2, x1:x2] = 255
+        return mask
+
+
 class MovingMaskTracker:
     """Produce a tight per-frame mask for a watermark that changes position.
 
@@ -578,6 +611,7 @@ class WatermarkProcessor:
         cancel_check: Callable[[], bool] | None = None,
         timed_mask_regions: list | None = None,
         max_frames: int | None = None,
+        frame_tracks: list | None = None,
     ) -> Path:
         input_path = Path(input_path)
         output_path = Path(output_path)
@@ -668,10 +702,18 @@ class WatermarkProcessor:
 
             from app.services.video_repair import repair_video
 
+            # Trajectory-tracked masks follow dynamic moving watermarks frame-by-frame.
             # Time-scoped regions describe watermarks that change layout during
             # the clip, so they are used verbatim: each frame is masked only where
             # a watermark actually is at that moment.
-            if timed_mask_regions:
+            if frame_tracks:
+                provider = FrameTrajectoryMaskProvider(frame_tracks, height, width)
+                if remove_subtitle:
+                    provider = _OverlayMaskProvider(
+                        provider,
+                        self._generate_mask((height, width), [], "custom", True),
+                    )
+            elif timed_mask_regions:
                 provider = TimedMaskProvider(
                     timed_mask_regions, height, width, fps, source_timestamps
                 )
@@ -735,7 +777,14 @@ class WatermarkProcessor:
         # Using only the static mask here silently ignored time-scoped regions and
         # produced a video with an empty mask, i.e. an unmodified copy reported as
         # a finished repair.
-        if timed_mask_regions:
+        if frame_tracks:
+            frame_mask_provider = FrameTrajectoryMaskProvider(frame_tracks, height, width)
+            if remove_subtitle:
+                frame_mask_provider = _OverlayMaskProvider(
+                    frame_mask_provider,
+                    self._generate_mask((height, width), [], "custom", True),
+                )
+        elif timed_mask_regions:
             frame_mask_provider = TimedMaskProvider(
                 timed_mask_regions, height, width, fps, source_timestamps
             )

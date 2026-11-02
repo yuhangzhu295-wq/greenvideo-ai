@@ -9,7 +9,11 @@ import type {
   WatermarkPayload
 } from "./types";
 
-export const API_BASE_URL = process.env.TARO_APP_API_BASE_URL || "http://127.0.0.1:8000";
+// H5 is served by the FastAPI backend itself, so use same-origin relative URLs.
+// Mini programs have no origin and need an absolute address.
+const ENV_BASE = process.env.TARO_APP_API_BASE_URL || "";
+export const API_BASE_URL =
+  process.env.TARO_ENV === "h5" ? ENV_BASE : ENV_BASE || "http://127.0.0.1:8000";
 const IS_DEMO_MODE = process.env.TARO_APP_DEMO_MODE === "true";
 
 type RequestOptions = {
@@ -29,12 +33,15 @@ function detailToMessage(detail: ErrorDetail | undefined): string {
 
 function networkMessage(error: unknown): string {
   if (error instanceof Error && error.message) return error.message;
-  return `后端服务未连接。请先运行 scripts/start-local.ps1，或配置 TARO_APP_API_BASE_URL。当前地址：${API_BASE_URL}`;
+  const errMsg = (error as { errMsg?: string } | null)?.errMsg;
+  const target = API_BASE_URL || "同源地址";
+  return `请求失败${errMsg ? `（${errMsg}）` : ""}。请确认后端已启动（scripts/start-local.ps1）。当前地址：${target}`;
 }
 
 export function toAbsoluteUrl(path: string | null | undefined): string {
   if (!path) return "";
   if (/^https?:\/\//.test(path)) return path;
+  if (!API_BASE_URL) return path.startsWith("/") ? path : `/${path}`;
   return `${API_BASE_URL}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
@@ -107,10 +114,11 @@ export async function uploadWatermarkFile(
   options: WatermarkPayload
 ): Promise<{ task_id: string; status: string }> {
   try {
-    const response = await Taro.uploadFile({
+    const uploadParams: any = {
       url: toAbsoluteUrl("/api/tasks/watermark"),
       filePath,
       name: "file",
+      withCredentials: false,
       formData: {
         mask_regions: JSON.stringify(options.mask_regions || []),
         timed_mask_regions: JSON.stringify(options.timed_mask_regions || []),
@@ -123,7 +131,8 @@ export async function uploadWatermarkFile(
         source_task_id: options.source_task_id || "",
         video_url: options.video_url || ""
       }
-    });
+    };
+    const response = await Taro.uploadFile(uploadParams);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       let message = "上传失败";
       try {

@@ -12,22 +12,23 @@ PLATFORM_KEYWORDS = (
     "抖音", "快手", "小红书", "视频号", "微博", "bilibili",
     "douyin", "kuaishou", "tiktok", "搜索", "全屋定制",
     "豆包", "剪映", "ai生成", "生成", "水印",
-    "号", "id", "q ", "○"
+    "号", "id", "q ", "○", "作者", "布丁"
 )
 
-def run_detection(video_path: str, end_frame: int | None = None, sample_sec: float = 1.0) -> list[dict]:
+def run_detection(video_path: str, end_frame: int | None = None, sample_sec: float = 1.0, raw: bool = False, start_frame: int = 0) -> list[dict]:
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
+
     max_f = end_frame if end_frame is not None and end_frame > 0 else total
     max_f = min(max_f, total)
+    min_f = max(0, min(start_frame, max_f - 1))
     max_dur = max_f / fps
-    
+
     interval = max(1, int(fps * sample_sec))
-    sample_indices = list(range(0, max_f, interval))
+    sample_indices = list(range(min_f, max_f, interval))
     
     # Central safety zone: [0.25W..0.75W, 0.20H..0.80H]
     cz_x1, cz_x2 = int(width * 0.25), int(width * 0.75)
@@ -55,70 +56,121 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
         cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
         ret, frame = cap.read()
         if not ret: break
-        
-        res = ocr.predict(frame)
-        for r in res:
-            texts = r.get("rec_texts")
-            scores = r.get("rec_scores")
-            boxes = r.get("rec_boxes")
-            if texts is None or boxes is None or scores is None:
-                continue
-            for txt, sc, b in zip(texts, scores, boxes):
-                if sc < 0.5: continue
-                bx1, by1, bx2, by2 = int(b[0]), int(b[1]), int(b[2]), int(b[3])
-                bw, bh = bx2 - bx1, by2 - by1
-                if bw <= 0 or bh <= 0: continue
-                
-                # Check center safety zone
-                if in_center_safety_zone(bx1, by1, bw, bh):
+
+        # Semi-transparent watermarks on dark backgrounds (cave, night sky)
+        # fall below OCR's contrast floor. A CLAHE-enhanced pass recovers them;
+        # both passes feed the same candidate pool, duplicates merge later.
+        frames_to_ocr = [frame]
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        lab[..., 0] = clahe.apply(lab[..., 0])
+        frames_to_ocr.append(cv2.cvtColor(lab, cv2.COLOR_LAB2BGR))
+
+        for frame_variant in frames_to_ocr:
+            res = ocr.predict(frame_variant)
+            for r in res:
+                texts = r.get("rec_texts")
+                scores = r.get("rec_scores")
+                boxes = r.get("rec_boxes")
+                if texts is None or boxes is None or scores is None:
                     continue
-                    
-                # Keyword check: short random noise words in the background shouldn't trigger
-                # unless they look like platform watermarks
-                txt_lower = txt.lower()
-                is_platform = any(k in txt_lower for k in PLATFORM_KEYWORDS) or len(txt) >= 4
-                if not is_platform and sc < 0.85:
-                    continue
-                
-                # Logo icon is typically to the left of the platform text (e.g. Douyin 'd' note).
-                # Expand left only when adjacent to the platform logo header; for normal text lines,
-                # use tight padding so dark frame borders (like sky) are preserved for inpainting context.
-                is_logo_header = any(k in txt_lower for k in ("抖音", "快手", "小红书", "bilibili", "douyin", "kuaishou"))
-                if is_logo_header:
-                    pad_left = max(int(bh * 1.35), int(bw * 0.25))
-                else:
-                    pad_left = max(6, min(int(bh * 0.35), 12))
-                pad_top = max(6, min(int(bh * 0.25), 8))
-                pad_right = max(8, min(int(bh * 0.35), 14))
-                pad_bot = max(8, min(int(bh * 0.35), 14))
-                
-                fx1 = max(0, bx1 - pad_left)
-                fy1 = max(0, by1 - pad_top)
-                fx2 = min(width, bx2 + pad_right)
-                fy2 = min(height, by2 + pad_bot)
-                
-                raw_candidates.append({
-                    "time_s": t_sec,
-                    "box": (fx1, fy1, fx2 - fx1, fy2 - fy1),
-                    "text": txt,
-                    "score": float(sc)
-                })
+                for txt, sc, b in zip(texts, scores, boxes):
+                    if sc < 0.5: continue
+                    bx1, by1, bx2, by2 = int(b[0]), int(b[1]), int(b[2]), int(b[3])
+                    bw, bh = bx2 - bx1, by2 - by1
+                    if bw <= 0 or bh <= 0: continue
+
+                    # Center check: scene content in the center (actor, clothes, props) should be protected
+                    # unless it matches platform keywords (e.g. Douyin/Kuaishou search card or promo ID)
+                    txt_lower = txt.lower()
+                    is_platform = any(k in txt_lower for k in PLATFORM_KEYWORDS)
+                    if in_center_safety_zone(bx1, by1, bw, bh) and not is_platform:
+                        continue
+                    if not is_platform and sc < 0.85:
+                        continue
+
+                    # Logo icon is typically to the left of the platform text (e.g. Douyin 'd' note, Kuaishou camera).
+                    # Expand left only when adjacent to the platform logo header; for normal text lines,
+                    # use tight padding so dark frame borders (like sky) are preserved for inpainting context.
+                    is_logo_header = any(k in txt_lower for k in ("抖音", "快手", "小红书", "bilibili", "douyin", "kuaishou", "豆包", "剪映", "视频号")) or len(txt) <= 3
+                    if is_logo_header:
+                        pad_left = min(int(bh * 1.45), int(width * 0.09))
+                        pad_right = max(16, int(bh * 0.55))
+                        pad_top = max(10, int(bh * 0.35))
+                        pad_bot = max(10, int(bh * 0.35))
+                    else:
+                        pad_left = max(6, min(int(bh * 0.35), 12))
+                        pad_right = max(8, min(int(bh * 0.35), 14))
+                        pad_top = max(6, min(int(bh * 0.25), 8))
+                        pad_bot = max(8, min(int(bh * 0.35), 14))
+
+                    fx1 = max(0, bx1 - pad_left)
+                    fy1 = max(0, by1 - pad_top)
+                    fx2 = min(width, bx2 + pad_right)
+                    fy2 = min(height, by2 + pad_bot)
+
+                    # Companion avatar/icon expansion on left side (e.g. Xiaohongshu avatar at left of nickname)
+                    if int(width * 0.03) <= bx1 <= int(width * 0.30):
+                        fx1 = max(0, bx1 - int(bh * 4.0))
+                        if fx1 <= int(width * 0.08):
+                            fx1 = 0
+                        fy1 = max(0, by1 - max(pad_top, int(bh * 0.50)))
+                        fy2 = min(height, by2 + max(pad_bot, int(bh * 0.50)))
+                    # Companion avatar/icon expansion on right side (e.g. Xiaohongshu avatar at right of nickname)
+                    if int(width * 0.70) <= bx2 <= int(width * 0.97):
+                        fx2 = min(width, bx2 + int(bh * 4.0))
+                        if fx2 >= int(width * 0.92):
+                            fx2 = width
+                        fy1 = max(0, by1 - max(pad_top, int(bh * 0.50)))
+                        fy2 = min(height, by2 + max(pad_bot, int(bh * 0.50)))
+
+                    raw_candidates.append({
+                        "time_s": t_sec,
+                        "box": (fx1, fy1, fx2 - fx1, fy2 - fy1),
+                        "text": txt,
+                        "score": float(sc)
+                    })
                 
     cap.release()
-    
+
+    # Raw mode: return per-frame sightings without spatial clustering so the
+    # caller can reconstruct a floating watermark's full travel path.
+    if raw:
+        return [
+            {
+                "time_s": round(float(c["time_s"]), 2),
+                "box": [int(v) for v in c["box"]],
+                "text": c["text"],
+                "score": round(float(c["score"]), 3),
+            }
+            for c in raw_candidates
+        ]
+
+    def get_quadrant(bx, by, bw, bh):
+        cx, cy = bx + bw / 2, by + bh / 2
+        qx = 0 if cx < width * 0.4 else (1 if cx > width * 0.6 else -1)
+        qy = 0 if cy < height * 0.35 else (1 if cy > height * 0.65 else -1)
+        return (qx, qy) if qx != -1 and qy != -1 else None
+
     # Cluster candidates spatially
     clusters = []
     for cand in raw_candidates:
         t_sec = cand["time_s"]
         x, y, w, h = cand["box"]
+        q_cand = get_quadrant(x, y, w, h)
         matched = False
         for c in clusters:
             cx, cy, cw, ch = c["box"]
+            q_c = get_quadrant(cx, cy, cw, ch)
+            same_quad = (q_cand is not None) and (q_cand == q_c)
             inter_x = max(0, min(x + w, cx + cw) - max(x, cx))
             inter_y = max(0, min(y + h, cy + ch) - max(y, cy))
             inter = inter_x * inter_y
             u = w * h + cw * ch - inter
-            if (inter / u > 0.2) or (abs(x - cx) < width * 0.12 and abs(y - cy) < height * 0.12):
+            horiz_overlap = (inter_x / min(w, cw) > 0.3) if min(w, cw) > 0 else False
+            vert_near = abs(y - cy) < height * 0.08
+            
+            if same_quad or (inter / u > 0.15) or (horiz_overlap and vert_near):
                 c["member_boxes"].append((x, y, w, h))
                 c["times"].append(t_sec)
                 c["texts"].append(cand["text"])
@@ -134,13 +186,26 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
                 "scores": [cand["score"]]
             })
             
-    # Keep clusters with persistent presence (seen in at least 2 sampled frames)
-    # and not spanning huge areas.
-    # Use the median of member boxes so occasional single-frame noise does not
-    # distort the true watermark extent.
+    # Keep clusters with persistent presence and not spanning huge areas.
+    # A single high-confidence platform-keyword sighting is enough: a coarse
+    # sample can catch a corner watermark only once (sampling phase), and the
+    # caller then re-scans densely with the text as the tracker seed.
     results = []
     for c in clusters:
-        if len(c["times"]) >= 2:
+        best_score = max(c["scores"]) if c["scores"] else 0.0
+        best_text = max(c["texts"], key=len) if c["texts"] else ""
+        is_platform_text = any(k in best_text.lower() for k in PLATFORM_KEYWORDS)
+        persistent = len(c["times"]) >= 2 or (best_score >= 0.9 and is_platform_text)
+        if persistent:
+            # Detect a moving/floating watermark: member boxes spread far apart.
+            # A drifting anti-piracy watermark travels across the frame, so a
+            # single small envelope cannot cover it - the caller must track it.
+            xs = [b[0] + b[2] / 2.0 for b in c["member_boxes"]]
+            ys = [b[1] + b[3] / 2.0 for b in c["member_boxes"]]
+            spread_x = float(np.max(xs) - np.min(xs))
+            spread_y = float(np.max(ys) - np.min(ys))
+            is_moving = spread_x > max(60.0, width * 0.06) or spread_y > max(60.0, height * 0.06)
+
             # A watermark block in a corner frequently contains multiple vertically
             # stacked text lines (e.g. logo line + ID line + search line). The
             # overall envelope must bound all lines in that corner cluster.
@@ -152,11 +217,26 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
             by = int(np.min(m_ys))
             bx2 = int(np.max(m_x2s))
             by2 = int(np.max(m_y2s))
+
+            # Subtle edge snap: if naturally close to edge (< 12px), snap cleanly
+            # to prevent leftover avatar/pill border slivers that cause inpainting smudges
+            if bx < 12:
+                bx = 0
+            if width - bx2 < 12:
+                bx2 = width
+            if by < 10:
+                by = 0
+            if height - by2 < 10:
+                by2 = height
+
             bw = bx2 - bx
             bh = by2 - by
-            
-            # Max area sanity check: a watermark should not exceed 8% of the frame
-            if (bw * bh) > (width * height * 0.08):
+
+            # Max area sanity check: a watermark should not exceed 8% of the frame.
+            # A genuinely moving watermark's full travel envelope is exempt: the
+            # caller uses the template of the first sighting to track it densely,
+            # the envelope is only a hint of where it travels.
+            if not is_moving and (bw * bh) > (width * height * 0.08):
                 continue
             start_s = max(0.0, min(c["times"]) - 0.2)
             end_s = min(max_dur, max(c["times"]) + 1.2)
@@ -165,19 +245,30 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
                 "start_s": round(start_s, 2),
                 "end_s": round(end_s, 2),
                 "confidence": round(float(np.mean(c["scores"])), 3),
-                "texts": list(set(c["texts"]))[:3]
+                "texts": list(set(c["texts"]))[:3],
+                "is_moving": is_moving,
+                # First sighting (smallest timestamp) with its tight box: the
+                # template used for dense tracking of a floating watermark.
+                "seed_box": [int(c["member_boxes"][list(c["times"]).index(min(c["times"]))][0]),
+                             int(c["member_boxes"][list(c["times"]).index(min(c["times"]))][1]),
+                             int(c["member_boxes"][list(c["times"]).index(min(c["times"]))][2]),
+                             int(c["member_boxes"][list(c["times"]).index(min(c["times"]))][3])],
+                "seed_time_s": round(float(min(c["times"])), 2),
             })
-            
-    return results
 
+    return results
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--video", required=True)
     parser.add_argument("--end-frame", type=int, default=None)
+    parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--sample-sec", type=float, default=1.0)
+    parser.add_argument("--raw", action="store_true",
+                        help="Return per-frame sightings without spatial clustering")
     args = parser.parse_args()
-    
-    res = run_detection(args.video, args.end_frame, args.sample_sec)
+
+    res = run_detection(args.video, args.end_frame, args.sample_sec, raw=args.raw,
+                        start_frame=args.start_frame)
     print("OUTPUT_JSON:" + json.dumps(res, ensure_ascii=False))
 
 if __name__ == "__main__":
