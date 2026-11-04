@@ -612,6 +612,8 @@ class WatermarkProcessor:
         timed_mask_regions: list | None = None,
         max_frames: int | None = None,
         frame_tracks: list | None = None,
+        pixel_mask_prompts: dict[int, list[dict]] | None = None,
+        mask_debug_dir: str | Path | None = None,
     ) -> Path:
         input_path = Path(input_path)
         output_path = Path(output_path)
@@ -698,11 +700,47 @@ class WatermarkProcessor:
 
             from app.services.video_repair import repair_video
 
-            # Trajectory-tracked masks follow dynamic moving watermarks frame-by-frame.
-            # Time-scoped regions describe watermarks that change layout during
-            # the clip, so they are used verbatim: each frame is masked only where
-            # a watermark actually is at that moment.
-            if frame_tracks:
+            # Pixel-level path: when SAM2 prompts are available, segment actual
+            # watermark pixels instead of writing whole rectangles as 255. The
+            # detection boxes serve only as SAM prompts / search windows; the
+            # repair engine receives the pixel mask. Falls back to the legacy
+            # rectangle providers only when SAM2 worker is unavailable.
+            pixel_provider = None
+            if pixel_mask_prompts:
+                try:
+                    from app.services.watermark_detection.pixel_mask_provider import (
+                        PixelMaskProvider,
+                    )
+
+                    debug = Path(mask_debug_dir) if mask_debug_dir else None
+                    pixel_provider = PixelMaskProvider(
+                        input_path, height, width,
+                        prompts=pixel_mask_prompts, debug_dir=debug,
+                    )
+
+                    def _read_frame(f_idx: int):
+                        cap_p = cv2.VideoCapture(str(input_path))
+                        cap_p.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+                        ret, fr = cap_p.read()
+                        cap_p.release()
+                        return fr if ret else None
+
+                    pixel_provider.build_tracks(_read_frame)
+                    if progress_cb:
+                        progress_cb(14, "SAM 2.1 像素级水印分割完成")
+                except Exception as exc:
+                    if progress_cb:
+                        progress_cb(14, f"SAM2 分割不可用（{exc}），回退矩形 mask")
+                    pixel_provider = None
+
+            if pixel_provider is not None:
+                provider = pixel_provider
+                if remove_subtitle:
+                    provider = _OverlayMaskProvider(
+                        provider,
+                        self._generate_mask((height, width), [], "custom", True),
+                    )
+            elif frame_tracks:
                 provider = FrameTrajectoryMaskProvider(frame_tracks, height, width)
                 if remove_subtitle:
                     provider = _OverlayMaskProvider(

@@ -702,6 +702,31 @@ async def _run_watermark_task_locked(
             def progress(progress: int, stage: str) -> None:
                 _safe_stage(task_id, progress, stage)
 
+            # Build SAM2 pixel-mask prompts from detection boxes. Each detected
+            # watermark becomes a prompt at its first active frame; SAM2 then
+            # segments actual pixels and propagates across frames. The rectangle
+            # is only a detection prompt / search window, never the repair mask.
+            pixel_mask_prompts: dict[int, list[dict]] | None = None
+            if (
+                payload.repair_mode == "ai"
+                and "detection" in locals()
+                and detection
+                and getattr(detection, "detections", None)
+            ):
+                try:
+                    probe_fps = _probe_fps(source_path)
+                    pixel_mask_prompts = {}
+                    for det in detection.detections:
+                        f0 = max(0, int((det.start_s or 0.0) * probe_fps))
+                        bx, by, bw, bh = det.box
+                        pixel_mask_prompts.setdefault(f0, []).append(
+                            {"box": [bx, by, bw, bh]}
+                        )
+                except Exception:
+                    pixel_mask_prompts = None
+
+            mask_debug = Path("artifacts") / "watermark-mask" / task_id
+
             await asyncio.to_thread(
                 processor.process_video,
                 source_path,
@@ -717,6 +742,8 @@ async def _run_watermark_task_locked(
                 getattr(detection, "frame_tracks", None)
                 if "detection" in locals() and detection
                 else None,
+                pixel_mask_prompts,
+                str(mask_debug),
             )
             engine = processor.last_engine
             engine_note = processor.last_engine_note
