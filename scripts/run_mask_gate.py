@@ -124,25 +124,25 @@ def run_gate(dataset_dir: str | Path, sample_frames: int = 3) -> dict:
     }
 
 
-    if __name__ == "__main__":
-        dataset = sys.argv[1] if len(sys.argv) > 1 else "artifacts/gt-dataset"
-        report = run_gate(dataset)
-        if report["total_samples"] == 0:
-            print("GATE RESULT: FAIL (zero samples evaluated — cannot verify)")
-            sys.exit(1)
-        out = Path(dataset) / "gate_report_real.json"
-        out.write_text(json.dumps(report, indent=2), encoding="utf-8")
-        print(json.dumps({k: v for k, v in report.items() if k != "results"}, indent=2))
-        print(f"\nGate report saved to {out}")
-        pixel_ok = report["pixel_gate_passed"] == report["total_samples"]
-        rect_rejected = report["rect_gate_passed"] == 0
-        if pixel_ok and rect_rejected:
-            print("GATE RESULT: PASS (real SAM2 pixel masks pass, rectangles rejected)")
-        else:
-            print(
-                f"GATE RESULT: {'PASS' if pixel_ok and rect_rejected else 'FAIL'} "
-                f"(pixel {report['pixel_gate_passed']}/{report['total_samples']}, "
-                f"rect {report['rect_gate_passed']})"
-            )
-        if not (pixel_ok and rect_rejected):
-            sys.exit(1)
+if __name__ == "__main__":
+    dataset = sys.argv[1] if len(sys.argv) > 1 else "artifacts/gt-dataset"
+    report = run_gate(dataset)
+    if report["total_samples"] == 0:
+        print("GATE RESULT: FAIL (zero samples evaluated — cannot verify)")
+        sys.exit(1)
+    out = Path(dataset) / "gate_report_real.json"
+    out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(json.dumps({k: v for k, v in report.items() if k != "results"}, indent=2))
+    print(f"\nGate report saved to {out}")
+    pixel_ok = report["pixel_gate_passed"] == report["total_samples"]
+    rect_rejected = report["rect_gate_passed"] == 0
+    if pixel_ok and rect_rejected:
+        print("GATE RESULT: PASS (real SAM2 pixel masks pass, rectangles rejected)")
+    else:
+        print(
+            f"GATE RESULT: {'PASS' if pixel_ok and rect_rejected else 'FAIL'} "
+            f"(pixel {report['pixel_gate_passed']}/{report['total_samples']}, "
+            f"rect {report['rect_gate_passed']})"
+        )
+    if not (pixel_ok and rect_rejected):
+        sys.exit(1)

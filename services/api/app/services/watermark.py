@@ -802,6 +802,11 @@ class WatermarkProcessor:
                     f"已调用 IOPaint LaMa 执行 AI 修复：修复 {report.frames_repaired} 帧，"
                     f"平均遮罩覆盖率 {report.mask_coverage_pct}%，"
                     f"音频保留 {report.audio_preserved}。"
+                    + (
+                        " [注意：SAM2 像素级分割不可用，已回退至矩形 mask]"
+                        if pixel_provider is None and pixel_mask_prompts
+                        else ""
+                    )
                 ),
             )
             self.last_repair_report = report

@@ -141,6 +141,7 @@ def _run_propagate_video(video_model, req) -> dict:
             for obj_mask_logit in mask_logits:
                 m = (obj_mask_logit > 0.0).cpu().numpy()
                 combined = combined | m
+            combined = np.squeeze(combined)  # ensure (H, W) for cv2.imencode
             results[str(f)] = {
                 "mask_b64": _encode_mask(combined),
                 "area": int(combined.sum()),

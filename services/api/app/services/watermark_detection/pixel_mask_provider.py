@@ -117,8 +117,9 @@ class PixelMaskProvider:
                 x1, y1, x2, y2 = plist[0]["box"]
                 self.tracks.add_mask(kf, combined_mask, box=(x1, y1, x2 - x1, y2 - y1))
                 self._save_debug(kf, frame, boxes_used, combined_mask)
-                # Collect prompt for video propagation
-                keyframe_prompts[kf] = {"box": plist[0]["box"]}
+                # Pass ALL boxes for this keyframe to video propagation so
+                # SAM2 can track each watermark instance independently.
+                keyframe_prompts[kf] = [{"box": p["box"]} for p in plist]
 
             # Phase 2: Propagate masks across the full video using SAM2 video predictor.
             # This fills in every frame between/after keyframes — without this,
