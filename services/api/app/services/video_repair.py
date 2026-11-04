@@ -225,6 +225,182 @@ class LamaWorker:
             self._proc = None
 
 
+class SttnWorker:
+    """Persistent STTN process (sttn-worker dir, ai-worker venv: torch+CUDA).
+
+    STTN repairs a whole window of frames in one forward pass, attending
+    across time — the temporal-consistency engine for dynamic watermarks that
+    per-frame LaMa + blending cannot provide. Frames travel via staged .npz
+    files (a 100-frame clip is far too large for a base64 JSON line); the
+    worker streams back a repaired .npz.
+
+    Explicit availability contract: `start()` raises when the worker script,
+    interpreter or weights are missing. Callers must surface that as an
+    engine-availability fact, never silently fall back to LaMa.
+    """
+
+    _worker_script = (
+        Path(__file__).resolve().parent.parent.parent.parent.parent
+        / "sttn-worker" / "sttn_worker.py"
+    )
+    _worker_python = (
+        Path(__file__).resolve().parent.parent.parent.parent.parent
+        / "ai-worker" / ".venv" / "Scripts" / "python.exe"
+    )
+
+    def __init__(self) -> None:
+        self._proc: subprocess.Popen | None = None
+        self._queue: queue.Queue[str] | None = None
+        self._loaded = False
+
+    @classmethod
+    def default_weights_path(cls) -> Path:
+        return cls._worker_script.parent / "weights" / "sttn.pth"
+
+    @classmethod
+    def is_available(cls, weights: Path | str | None = None) -> bool:
+        w = Path(weights) if weights else cls.default_weights_path()
+        return (
+            cls._worker_script.exists()
+            and cls._worker_python.exists()
+            and w.exists()
+        )
+
+    def is_alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def start(self, timeout_s: float = 90.0) -> None:
+        if not self._worker_script.exists() or not self._worker_python.exists():
+            raise AiServiceError("STTN worker 脚本或 ai-worker 解释器不存在")
+        self._proc = subprocess.Popen(
+            [str(self._worker_python), str(self._worker_script)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            cwd=str(self._worker_script.parent),
+        )
+        self._queue = queue.Queue()
+
+        def _enqueue(pipe, q):
+            try:
+                for line in iter(pipe.readline, ""):
+                    q.put(line)
+            except Exception:
+                pass
+            finally:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+
+        threading.Thread(
+            target=_enqueue, args=(self._proc.stdout, self._queue), daemon=True
+        ).start()
+
+        try:
+            ready_line = self._queue.get(timeout=timeout_s)
+        except Exception as exc:
+            self.stop()
+            raise AiServiceError(f"STTN worker 启动超时 ({timeout_s}s)") from exc
+        try:
+            ready = json.loads(ready_line.strip() or "{}")
+        except Exception as exc:
+            self.stop()
+            raise AiServiceError(f"STTN worker 响应格式错误：{ready_line}") from exc
+        if not ready.get("ready"):
+            self.stop()
+            raise AiServiceError(f"STTN worker 启动失败：{ready}")
+
+    def load(self, weights: Path | str | None = None, timeout_s: float = 120.0) -> None:
+        w = Path(weights) if weights else self.default_weights_path()
+        if not w.exists():
+            raise AiServiceError(f"STTN 权重不存在：{w}")
+        self._send_and_wait({"op": "load", "weights": str(w)}, timeout_s, "STTN load")
+        self._loaded = True
+
+    def repair_clip(
+        self,
+        frames: list,
+        masks: list,
+        chunk: int = 40,
+        overlap: int = 8,
+        timeout_s: float = 600.0,
+    ) -> tuple[list, dict]:
+        """Repair a clip (BGR frames + gray masks); returns (frames, meta)."""
+        import numpy as np
+
+        if not self.is_alive():
+            raise AiServiceError("STTN worker 进程已终止")
+        if not self._loaded:
+            raise AiServiceError("STTN 权重未加载")
+
+        stage_dir = Path(tempfile.mkdtemp(prefix="sttn-"))
+        src = stage_dir / "clip.npz"
+        out = stage_dir / "repaired.npz"
+        np.savez_compressed(src, frames=np.stack(frames, axis=0), masks=np.stack(masks, axis=0))
+        try:
+            resp = self._send_and_wait(
+                {
+                    "op": "repair_clip_file",
+                    "npz": str(src),
+                    "out_npz": str(out),
+                    "chunk": int(chunk),
+                    "overlap": int(overlap),
+                },
+                timeout_s,
+                "STTN repair",
+            )
+            if not out.exists():
+                raise AiServiceError(f"STTN worker 未产出结果：{resp}")
+            blob = np.load(out)
+            repaired = [blob["frames"][i] for i in range(blob["frames"].shape[0])]
+            meta = {
+                "engine": str(blob["engine"]) if "engine" in blob.files else "sttn",
+                "chunks": int(blob["chunks"]) if "chunks" in blob.files else 0,
+            }
+            return repaired, meta
+        finally:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+
+    def _send_and_wait(self, req: dict, timeout_s: float, what: str) -> dict:
+        try:
+            self._proc.stdin.write(json.dumps(req) + "\n")
+            self._proc.stdin.flush()
+        except Exception as exc:
+            self.stop()
+            raise AiServiceError(f"向 STTN worker 发送请求失败：{exc}") from exc
+        try:
+            line = self._queue.get(timeout=timeout_s)
+        except Exception as exc:
+            self.stop()
+            raise AiServiceError(f"{what} 超时 ({timeout_s}s)") from exc
+        if not line:
+            self.stop()
+            raise AiServiceError("STTN worker 已退出")
+        resp = json.loads(line.strip() or "{}")
+        if not resp.get("ok"):
+            raise AiServiceError(f"{what} 失败：{resp.get('error', resp)}")
+        return resp
+
+    def stop(self) -> None:
+        if self._proc is not None:
+            try:
+                if self._proc.stdin:
+                    self._proc.stdin.close()
+                if self._proc.stdout:
+                    self._proc.stdout.close()
+                self._proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self._proc.kill()
+                    self._proc.wait(timeout=2)
+                except Exception:
+                    pass
+            self._proc = None
+
+
 def _inpaint_frame(
     frame,
     mask,

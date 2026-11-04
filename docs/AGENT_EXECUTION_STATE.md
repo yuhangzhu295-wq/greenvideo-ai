@@ -585,3 +585,33 @@ OCR 路线（paddlepaddle 3.2.2 + PaddleOCR 3.7.0 CPU）实测可用但 11 秒/�
 
 ### 下一步
 - STTN worker（任务 6）、Temporal Gate（任务 11）、盲测 Reviewer（任务 14）
+
+## Round 9 — STTN 视频时序修复 Worker（2026-11-05）
+
+### Git
+- 基线：`8c3fbfb`（Round 8，双审查中）
+
+### 实施（goal 任务 6）
+1. **Vendor MIT 代码**：`services/sttn-worker/sttn/`（researchmm/STTN 模型定义 + core/spectral_norm，含 LICENSE 副本；import 路径改为包内相对）
+2. **Worker**（`services/sttn-worker/sttn_worker.py`）：stdin/stdout JSON 行协议；`load`（支持官方 `{"netG": sd}` 包装）/`ping`/`repair_clip_file`（npz 传输，100+ 帧片段不走 base64 行）
+3. **分块窗口**：`chunk_plan.py`（torch-free 可单测）— `plan_windows` 覆盖断言（无间隙无遗漏）+ `blend_zone` mask 内线性融合、mask 外逐位保持
+4. **OOM 降档**：`torch.cuda.OutOfMemoryError` → empty_cache → chunk 减半重试（min 4），仍失败则显式报错，**不静默切换引擎**
+5. **协议正确性**：输入帧需预掩膜（`frames*(1-mask)`，与官方推理一致）— 初版未掩膜导致 inside PSNR=5.06，修正后 15.99
+6. **API 客户端**（`video_repair.SttnWorker`）：显式可用性契约（`is_available()`），权重缺失时明确报错而非静默回退；**生产默认仍为 LaMa**
+
+### 许可合规
+- STTN 代码 MIT（vendor）；官方权重 CC-BY-NC 4.0 → 下载至 `services/sttn-worker/weights/`（.gitignore 已忽略）**仅 benchmark**
+- `docs/THIRD_PARTY_AI_LICENSE_AUDIT.md` 已更新实测证据与生产约束
+
+### 测试结果
+- 单元测试：6 个 chunk_plan 测试全过（覆盖率/无间隙/融合端点/mask 外不变）
+- GPU benchmark（`scripts/sttn_benchmark.py`，NC 权重，合成移动背景+移动水印 24 帧）：
+  - `outside_mask_bit_identical = 1.000000`（mask 外逐位不变）
+  - `inside_mask_psnr = 15.99`（>15 阈值）
+  - 2 chunks（16+overlap4 窗口），OOM 路径未触发（8GB 足够）
+- ruff：0 error
+
+### 下一步
+- Temporal Gate（任务 11：flicker/ghosting 跨帧一致性）
+- 盲测 Reviewer（任务 14：随机水印参数）
+- 双审查结果处理

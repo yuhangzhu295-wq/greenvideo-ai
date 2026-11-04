@@ -41,3 +41,6 @@ artifacts/
 recovery/
 work/
 services/ai-worker/checkpoints/
+
+# Model weights (NC-licensed STTN weights: benchmark only, never distribute)
+services/sttn-worker/weights/

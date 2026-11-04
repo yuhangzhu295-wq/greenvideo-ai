@@ -38,11 +38,11 @@
 - **风险**：无
 
 ### STTN
-- **代码**：https://github.com/researchmm/STTN — MIT License
+- **代码**：https://github.com/researchmm/STTN — MIT License（已 vendor 至 `services/sttn-worker/sttn/`，含 LICENSE 副本）
 - **预训练权重**：官方发布权重使用 CC-BY-NC 4.0（NonCommercial）
 - **商用**：代码 MIT 允许；**NC 权重不允许商用**
 - **方案**：可集成 STTN 架构代码 + 自行训练权重（或使用 MIT 替代权重），**不可直接加载官方 NC 权重进生产**
-- **状态**：Worker 架构可建；模型权重来源须另寻或自训
+- **状态**（2026-11-05）：Worker 已实现（`services/sttn-worker/sttn_worker.py`，GPU 常驻 + chunk/overlap 融合 + OOM 降档重试 + npz 传输 + mask 外像素逐位保持）。官方权重已下载至 `services/sttn-worker/weights/sttn.pth`（**git 已忽略，仅本机 benchmark**），实测 benchmark（`scripts/sttn_benchmark.py`）：outside_mask_bit_identical=1.0、inside_psnr=15.99（移动背景+移动水印合成片段）。**生产路径仍默认 LaMa**；STTN 仅在显式配置权重时可用，且 NC 权重限定 benchmark 用途，商用上线前必须替换为自训/MIT 权重。
 
 ### ProPainter
 - **代码 + 权重**：https://github.com/sczhou/ProPainter — NTU SLab License 4.0（NonCommercial）
