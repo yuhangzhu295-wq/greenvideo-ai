@@ -529,3 +529,59 @@ OCR 路线（paddlepaddle 3.2.2 + PaddleOCR 3.7.0 CPU）实测可用但 11 秒/�
 - 提升检测算法在复杂背景上的鲁棒性（单独任务）
 - 或引入专门的水印检测模型（需要训练数据）
 - 当前 SAM2 像素级 mask 管线架构已验证正确
+
+## Round 8 — 检测层架构重构：去 keyword 门禁 + 实体聚类 + prompt 治理（2026-11-05）
+
+### 当前 Git
+- 基线 commit：`2b96692`（Round 7）
+- 本轮改动：`services/ai-worker/ocr_detector_cli.py`（重构）、`services/api/app/services/watermark_detect.py`（staticness 百分位秩 + 链治理 + frame_prompts_at）、`services/api/app/routers/tasks.py`（prompt 构建走 attribution 过滤）、`scripts/run_e2e_gate.py`（同上）、`scripts/build_gt_watermark_dataset.py`（噪声 bug 修复）、`scripts/debug_ocr_raw.py`、`scripts/debug_sam2_prompts.py`（诊断脚本）
+
+### P0 缺陷（E2E Gate 3/4 场景 FAIL）
+- grass：OCR 0 检出 → fallback 6 误报框 → SAM2 mask 覆盖 78% 全帧 → LaMa 摧毁背景（outside_exact=0.20）
+- night：OCR 实际读出 '@user_watermark' score=1.000，但被持久性过滤+keyword 门禁静默丢弃（0 检出）
+- building：检出但移动插值 box 膨胀（gap_inflation 最高 1.9×）+ 同帧多 box OR → SAM2 P=0.26
+
+### 根因（全部实测复现，含 deep-reasoner 决策代理 72 次工具调用验证）
+1. `ocr_detector_cli.py` 用硬编码平台关键词做**准入门禁**（非平台词要求 score≥0.85）——goal 明确禁止关键词作主路径
+2. 聚类按象限+IoU 合并，corner-hop 每角落 1 次 sighting → 单 sighting 非平台词 → 静默丢弃
+3. `_staticness` 绝对阈值 `1-maxdev/40` 在噪声上把水印与背景同时压为 0
+4. 移动插值 box 无边界裁剪（x=-75 幻影框）、gap_inflation/hold-grow 膨胀、同帧 direct+interpolated box 全部 OR
+5. **GT 数据集生成器 bug**：`rng.normal(0,15).astype(np.uint8)` 负值回绕为 ~250，草地变成 50% 白色频闪（帧间 mean absdiff=81），任何时序滤波都无法穿透
+
+### 实施方案（决策代理裁定 A + C′ + D-temporal，不训练专用检测模型）
+1. **OCR CLI 重构**：收集所有 score≥0.5 文本候选（keyword 只作 confidence prior）；按**文本内容跨位置合并**成实体（Levenshtein ≤ len/4）；实体级持久性 ≥2 sightings；单 sighting 非平台词 → `UNCONFIRMED_JSON` 上报 stderr（不静默丢弃，供用户确认队列）；corner-hop 实体按紧致子簇拆分为多个静止检测（时间窗中点切分），绝不跨跳插值
+2. **`_staticness` 百分位秩**：`1 - percentile_rank(maxdev)` 帧内排名替代绝对阈值；staticness 权重 0.5→0.65；加 structure 门（overlay 必须静止且有线稿）防噪声像素经 close() 粘成全帧大 blob
+3. **`frame_prompts_at` attribution 过滤**：direct-evidence（tight static）box 优先；插值 box 仅在无直证帧使用；IoU>0.6 NMS；每帧 ≤3 prompt；边界裁剪
+4. **链治理**：gap_inflation 上限 1.15×、hold-grow 上限 1.4×、插值 box 裁剪到帧内、450px 离散跳变预拆分
+5. **GT 生成器修复**：噪声在 int 空间叠加（零均值），草地恢复为真实感噪声纹理
+
+### 测试结果
+- 单元测试：75 passed（ruff 全过）
+- OCR CLI 实测（4/4 场景检出）：
+  - grass（修复后数据集）：`bilibili` 3 sightings tight_box=(0,52,124,44) ✓
+  - sky：`douyin_id: 12345` ✓
+  - night：`@user_watermark` 2 个静止子簇（TL 0-0.75s / BR 0.75-2.0s），无跨心插值 ✓
+  - building：`TikTok @creator` moving 实体（dense 路径）✓
+- SAM2 prompt 实验：tight OCR box → building P=0.733/R=0.953、night P=0.656/R=0.993（对比膨胀 box P=0.26）
+- E2E Gate：见 `artifacts/gt-dataset/e2e_gate_report.json`（本轮重跑）
+
+### 追加修复（同轮内第 2、3 次迭代）
+1. **轨迹几何改用 tight_box**：raw sightings 的 padded box 带 companion-avatar 扩张（屏幕边缘侧最多 +4×bh），实测 272×34 tight vs 487×87 padded，把中值模板和中心点全部带偏。`_sightings_to_moving_detections` 改为优先 `tight_box`。
+2. **窗口扫描尺寸（window-swept box）**：固定尺寸框钉在中心时刻，而时间窗跨到邻点中点（高速时 ±0.16s ≈ ±145px 扫掠）→ 框过期失效（覆盖率 43.8%）。修复：每框按本地速度 × 自身窗口宽扩展（`mw + |vx|·win_w`），恰好覆盖窗口内扫掠走廊，不多不少。
+3. **structure 门**：百分位秩 staticness 会把背景摊满全秩域，p93 阈值留 7% 散点噪声像素，close() 粘成全帧 726k 大 blob 被 max_area 整体拒绝连坐水印。加 `structure ≥ 0.12` 门（overlay 必须静止且有线稿）后 Blob 消失。
+
+### 测试结果（最终）
+- 单元测试：**75 passed**（含修复后的 trajectory coverage 测试）；ruff 全过（改动文件 0 error）
+- GT E2E Gate：**8/8 PASS**（第 3 次运行，含最终代码）
+  - grass: P=0.524-0.533 R=1.000 exact=99.85%
+  - sky: P=0.474 R=1.000 exact=99.55%
+  - night: P=0.637-0.648 R=0.994-0.997 exact=99.8%
+  - building: P=0.705 R=0.977 exact=99.85%（重构前 P=0.26）
+  - 每帧恰好 1 个 prompt（attribution 过滤生效）
+- 报告：`artifacts/gt-dataset/e2e_gate_report.json`
+
+### Reviewer 结论
+- 待双审查（本轮完成后提交并送审）
+
+### 下一步
+- STTN worker（任务 6）、Temporal Gate（任务 11）、盲测 Reviewer（任务 14）

@@ -113,12 +113,32 @@ def _temporal_median(sample: list[np.ndarray]) -> np.ndarray:
     return np.median(stack, axis=0).astype(np.uint8)
 
 
+def _static_rank(maxdev: np.ndarray) -> np.ndarray:
+    """Convert per-pixel max deviation into a within-frame staticness rank.
+
+    An absolute grey-level cut (``1 - maxdev/40``) saturates on noisy footage:
+    both a semi-transparent overlay (maxdev ~80) and textured background
+    (maxdev ~140) clip to 0 and the signal is destroyed. Ranking each pixel
+    against the whole frame instead preserves the separation: the overlay sits
+    in the lowest deviation percentiles, whatever the absolute noise level.
+    """
+    flat = maxdev.reshape(-1).astype(np.float32)
+    n = flat.size
+    if n <= 1:
+        return np.ones_like(maxdev, dtype=np.float32)
+    order = np.argsort(flat, kind="stable")
+    ranks = np.empty(n, dtype=np.float32)
+    ranks[order] = np.arange(n, dtype=np.float32) / (n - 1)
+    return (1.0 - ranks).reshape(maxdev.shape)
+
+
 def _staticness(sample: list[np.ndarray], median: np.ndarray) -> np.ndarray:
     devs = [np.abs(f.astype(np.float32) - median.astype(np.float32)).mean(axis=2) for f in sample]
     maxdev = np.max(np.stack(devs, axis=0), axis=0)
-    # A pixel that never changes is an overlay candidate; 40 grey levels is the
-    # point where "moved" is considered certain.
-    return np.clip(1.0 - maxdev / 40.0, 0.0, 1.0)
+    # A pixel that never changes is an overlay candidate. Within-frame ranking
+    # keeps that signal separable on noisy backgrounds where absolute
+    # thresholds would flatten both overlay and texture to zero.
+    return _static_rank(maxdev)
 
 
 def _median_structure(median: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -336,6 +356,7 @@ def detect_watermarks(
     percentile: float = 93.0,
     min_score: float = 0.18,
     min_gradient: float = 28.0,
+    min_structure: float = 0.12,
 ) -> DetectionResult:
     """Locate overlay watermark regions in a list of BGR frames."""
     if not frames:
@@ -355,9 +376,19 @@ def detect_watermarks(
     # dominates because an overlay is by definition the part of the frame that
     # does not follow the scene; the structural terms then separate a real
     # overlay (drawn edges, text strokes) from a flat static area such as a sky
-    # or a solid-colour object.
+    # or a solid-colour object. The 0.65 staticness weight suppresses
+    # Sobel-dominated false positives on noisy footage (grass, foliage) where
+    # texture edges are everywhere but nothing is temporally static.
     structure = np.clip(grad / 60.0, 0.0, 1.0) * 0.3 + np.clip(contrast / 50.0, 0.0, 1.0) * 0.2
-    score = staticness * 0.5 + structure
+    score = staticness * 0.65 + structure
+    # An overlay is static AND drawn. Rank-based staticness spreads the
+    # background across the whole rank range, so on noisy footage the top
+    # percentile of the score map is mostly scattered flat-noise pixels; the
+    # percentile threshold alone then keeps them and the morphological close
+    # glues them into one frame-wide blob that max_area rejects. Requiring a
+    # minimum structure removes those flat-noise pixels before thresholding
+    # and leaves genuinely drawn overlays.
+    score = np.where(structure < min_structure, 0.0, score)
 
     boxes = _boxes_from_score(score, percentile, min_area, max_area)
     boxes = _merge_boxes(boxes, w, h)
@@ -429,7 +460,7 @@ def detect_watermarks(
     if detections:
         for frame in frames:
             dev = np.abs(frame.astype(np.float32) - median.astype(np.float32)).mean(axis=2)
-            frame_static = np.clip(1.0 - dev / 40.0, 0.0, 1.0)
+            frame_static = _static_rank(dev)
             fmask = np.zeros((h, w), dtype=np.uint8)
             for det in detections:
                 x, y, bw, bh = det.box
@@ -1158,6 +1189,8 @@ def _sightings_to_moving_detections(
     fps: float,
     end_frame: int,
     sub_step_s: float = 0.15,
+    width: int = 0,
+    height: int = 0,
 ) -> list[Detection]:
     """Convert raw per-frame OCR sightings into discrete corner or moving Detections.
 
@@ -1175,7 +1208,12 @@ def _sightings_to_moving_detections(
     for s in sightings:
         if not _fuzzy_text_hit(str(s.get("text", "")), target_texts):
             continue
-        box = tuple(int(v) for v in s.get("box", []))
+        # Trajectory geometry must use the tight OCR box. The padded box can
+        # carry companion-avatar expansion (up to 4x text height on the
+        # screen-edge side), which inflates the median template and shifts
+        # centres — measured 272x34 tight vs 487x87 padded on the GT drift.
+        raw_box = s.get("tight_box") or s.get("box")
+        box = tuple(int(v) for v in raw_box)
         if len(box) != 4 or box[2] <= 0 or box[3] <= 0:
             continue
         hits.append((float(s.get("time_s", 0.0)), box))
@@ -1194,6 +1232,76 @@ def _sightings_to_moving_detections(
     if not hits:
         return []
 
+    max_dur = end_frame / fps
+
+    # Discrete-hop pre-split: a corner-hopping watermark rests in 2+ spatially
+    # tight spots. When every sighting belongs to a tight sub-cluster and the
+    # gaps between sub-clusters are large, emit one static detection per
+    # resting spot instead of interpolating a trajectory through the screen.
+    # The 450px gap matches the jump criterion below: gaps below it are treated
+    # as continuous travel and stay on the interpolation path.
+    def _chain_spread(chain: list[tuple[float, tuple[int, int, int, int]]]) -> float:
+        xs = [b[0] + b[2] / 2.0 for _, b in chain]
+        ys = [b[1] + b[3] / 2.0 for _, b in chain]
+        return max(max(xs) - min(xs), max(ys) - min(ys))
+
+    def _centre(b: tuple[int, int, int, int]) -> tuple[float, float]:
+        return (b[0] + b[2] / 2.0, b[1] + b[3] / 2.0)
+
+    tight_groups: list[list[tuple[float, tuple[int, int, int, int]]]] = [[hits[0]]]
+    for h in hits[1:]:
+        if _chain_spread(tight_groups[-1] + [h]) <= 60.0:
+            tight_groups[-1].append(h)
+        else:
+            tight_groups.append([h])
+    group_gap_ok = all(
+        math.hypot(
+            _centre(tight_groups[i + 1][0][1])[0] - _centre(tight_groups[i][-1][1])[0],
+            _centre(tight_groups[i + 1][0][1])[1] - _centre(tight_groups[i][-1][1])[1],
+        )
+        > 450.0
+        for i in range(len(tight_groups) - 1)
+    )
+    all_tight = all(_chain_spread(g) < 60.0 for g in tight_groups)
+    if len(tight_groups) > 1 and all_tight and group_gap_ok:
+        all_detections: list[Detection] = []
+        for g_idx, group in enumerate(tight_groups):
+            xs0 = sorted(b[0] for _, b in group)
+            ys0 = sorted(b[1] for _, b in group)
+            ws = sorted(b[2] for _, b in group)
+            hs = sorted(b[3] for _, b in group)
+            median_box = (
+                xs0[len(xs0) // 2],
+                ys0[len(ys0) // 2],
+                ws[len(ws) // 2],
+                hs[len(hs) // 2],
+            )
+            t_start = (
+                0.0
+                if g_idx == 0
+                else round((tight_groups[g_idx - 1][-1][0] + group[0][0]) / 2.0, 2)
+            )
+            t_end = (
+                max_dur
+                if g_idx == len(tight_groups) - 1
+                else round((group[-1][0] + tight_groups[g_idx + 1][0][0]) / 2.0, 2)
+            )
+            mx, my, mw, mh = median_box
+            mx = max(0, min(int(mx), width - mw)) if width > mw > 0 else max(0, int(mx))
+            my = max(0, min(int(my), height - mh)) if height > mh > 0 else max(0, int(my))
+            all_detections.append(
+                Detection(
+                    box=(mx, my, mw, mh),
+                    area=mw * mh,
+                    score=0.95,
+                    kind="text",
+                    start_s=t_start,
+                    end_s=t_end,
+                    is_moving=False,
+                )
+            )
+        return all_detections
+
     # Overall spread check: if sightings across the entire video never move at all,
     # it belongs to the static detection path, not moving trajectories.
     xs_all = [b[0] + b[2] / 2.0 for _, b in hits]
@@ -1202,7 +1310,6 @@ def _sightings_to_moving_detections(
     if overall_spread < 60.0:
         return []
 
-    max_dur = end_frame / fps
 
     # Split into continuous chains.
     # An abrupt corner jump (e.g. TikTok switching between corners) is a sudden spatial jump:
@@ -1328,8 +1435,11 @@ def _sightings_to_moving_detections(
             max_gap = 0.0
             for idx in range(len(ch_hits) - 1):
                 max_gap = max(max_gap, ch_hits[idx + 1][0] - ch_hits[idx][0])
+            # Gap inflation only backstops recall; measured on the GT set,
+            # anything above ~1.15x inflates the SAM prompt and the mask
+            # precision collapses (P 0.73 -> 0.26).
             gap_inflation = (
-                1.0 + min(0.9, (max_gap / 0.4) * 0.35) if max_gap > 0.3 else 1.12
+                1.0 + min(0.15, (max_gap / 0.4) * 0.35) if max_gap > 0.3 else 1.12
             )
             mw = int(mw * gap_inflation)
             mh = int(mh * gap_inflation)
@@ -1359,8 +1469,6 @@ def _sightings_to_moving_detections(
                         )
 
             for idx, (t_s, cx, cy) in enumerate(centres):
-                ux = int(round(cx - mw / 2.0))
-                uy = int(round(cy - mh / 2.0))
                 seg_start = (
                     t_s - sub_step_s
                     if idx == 0
@@ -1371,10 +1479,36 @@ def _sightings_to_moving_detections(
                     if idx == len(centres) - 1
                     else (t_s + centres[idx + 1][0]) / 2.0 + sub_step_s / 2.0
                 )
+                # A fixed-size box pinned to the centre-time position goes
+                # stale across its own time window: at ~890 px/s a ±0.16s
+                # window sweeps ±145 px. Grow the box by the text's local
+                # travel during exactly this window so it always covers the
+                # watermark it claims to cover, and nothing further.
+                win_w = max(0.0, seg_end - seg_start)
+                if 0 < idx < len(centres) - 1 and centres[idx + 1][0] > centres[idx - 1][0]:
+                    vx = (centres[idx + 1][1] - centres[idx - 1][1]) / (
+                        centres[idx + 1][0] - centres[idx - 1][0]
+                    )
+                    vy = (centres[idx + 1][2] - centres[idx - 1][2]) / (
+                        centres[idx + 1][0] - centres[idx - 1][0]
+                    )
+                else:
+                    vx = vy = 0.0
+                cw = mw + abs(vx) * win_w
+                chh = mh + abs(vy) * win_w
+                ux = int(round(cx - cw / 2.0))
+                uy = int(round(cy - chh / 2.0))
+                # Extrapolated centres can fall outside the frame (phantom
+                # boxes hanging off the edge); clamp so the SAM prompt never
+                # extends past the picture.
+                if width > cw > 0:
+                    ux = max(0, min(ux, width - cw))
+                if height > chh > 0:
+                    uy = max(0, min(uy, height - chh))
                 all_detections.append(
                     Detection(
-                        box=(ux, uy, mw, mh),
-                        area=mw * mh,
+                        box=(ux, uy, int(cw), int(chh)),
+                        area=int(cw * chh),
                         score=0.95,
                         kind="tracked",
                         start_s=round(max(0.0, seg_start), 2),
@@ -1385,7 +1519,9 @@ def _sightings_to_moving_detections(
 
             hold_dur = max_dur - ch_hits[-1][0]
             if 0.15 < hold_dur <= 1.0:
-                grow = 1.4 + 0.5 * min(1.0, (hold_dur - 0.15) / 0.85)
+                # Hold-grow covers the tail between the last sighting and the video end;
+                # beyond 1.4x the prompt inflates and mask precision collapses.
+                grow = 1.4
                 lb = ch_hits[-1][1]
                 hw, hh = int(lb[2] * grow), int(lb[3] * grow)
                 hx = int(lb[0] + lb[2] / 2.0 - hw / 2.0)
@@ -1403,7 +1539,7 @@ def _sightings_to_moving_detections(
                 )
             head_hold = ch_hits[0][0]
             if 0.15 < head_hold <= 1.0:
-                grow = 1.4 + 0.5 * min(1.0, (head_hold - 0.15) / 0.85)
+                grow = 1.4
                 fb = ch_hits[0][1]
                 hw, hh = int(fb[2] * grow), int(fb[3] * grow)
                 hx = int(fb[0] + fb[2] / 2.0 - hw / 2.0)
@@ -1421,6 +1557,90 @@ def _sightings_to_moving_detections(
                 )
 
     return all_detections
+
+
+def frame_prompts_at(
+    detections: list[Detection],
+    frame_idx: int,
+    fps: float,
+    total_frames: int,
+    max_prompts: int = 3,
+) -> list[list[int]]:
+    """Select the SAM2 prompt boxes for one frame from timed detections.
+
+    Attribution filtering, not plain NMS: interpolated ``tracked`` boxes are
+    only used on frames with no direct evidence. When a tight static
+    detection covers the same frame, the interpolated box is dropped because
+    the OR of a tight box and its inflated interpolations is exactly the
+    over-segmentation that destroyed background in the P0 incident. Boxes are
+    clamped to the frame and capped at ``max_prompts`` by score.
+    """
+    if fps <= 0:
+        return []
+    t = frame_idx / fps
+    max_dur = total_frames / fps
+    covering = [
+        d
+        for d in detections
+        if (d.start_s or 0.0) <= t <= (d.end_s if d.end_s is not None else max_dur)
+    ]
+    if not covering:
+        return []
+
+    # Frame bounds come from the largest detection extent; the SAM worker
+    # clamps again internally, but prompt geometry should already be sane.
+    frame_w = max((d.box[0] + d.box[2] for d in detections), default=0)
+    frame_h = max((d.box[1] + d.box[3] for d in detections), default=0)
+
+    def _clamp(det: Detection) -> tuple[int, int, int, int]:
+        x, y, w, h = det.box
+        x = max(0, int(x))
+        y = max(0, int(y))
+        w = max(1, int(w))
+        h = max(1, int(h))
+        if frame_w > 0 and x + w > frame_w:
+            w = frame_w - x
+        if frame_h > 0 and y + h > frame_h:
+            h = frame_h - y
+        return (x, y, max(1, w), max(1, h))
+
+    def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+        x1, y1 = max(ax, bx), max(ay, by)
+        x2, y2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        union = aw * ah + bw * bh - inter
+        return inter / union if union else 0.0
+
+    def _is_tracked(d: Detection) -> bool:
+        return d.kind == "tracked" or d.is_moving is True
+
+    prompts: list[tuple[float, tuple[int, int, int, int]]] = []
+    # Direct-evidence (tight static) boxes always win.
+    for d in covering:
+        if not _is_tracked(d):
+            prompts.append((d.score, _clamp(d)))
+    # Interpolated boxes only where no direct box overlaps them: that frame
+    # has no sighting of its own and the interpolation is the only evidence.
+    for d in covering:
+        if _is_tracked(d):
+            bx = _clamp(d)
+            if any(_iou(bx, sb) > 0.3 for _, sb in prompts):
+                continue
+            prompts.append((d.score, bx))
+
+    # NMS among the survivors.
+    prompts.sort(key=lambda p: p[0], reverse=True)
+    kept: list[tuple[float, tuple[int, int, int, int]]] = []
+    for sc, bx in prompts:
+        if any(_iou(bx, kb) > 0.6 for _, kb in kept):
+            continue
+        kept.append((sc, bx))
+        if len(kept) >= max_prompts:
+            break
+
+    return [[x, y, x + w, y + h] for _, (x, y, w, h) in kept]
 
 
 def verify_watermark_removal(
@@ -1696,7 +1916,8 @@ def detect_timed_watermarks_hybrid(video_path: Path | str) -> DetectionResult:
                 )
             moving_dets = (
                 _sightings_to_moving_detections(
-                    dense_cache, target_texts, fps, content_end_frame
+                    dense_cache, target_texts, fps, content_end_frame,
+                    width=width, height=height,
                 )
                 if dense_cache
                 else []

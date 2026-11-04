@@ -27,19 +27,14 @@ from app.services.watermark_detection.sam2_client import Sam2Worker
 
 def _detect_boxes(video_path: str, frame_idx: int, fps: float, total: int) -> list[list[int]]:
     """Run automatic detection on one frame. Returns [x1,y1,x2,y2] boxes for SAM2."""
-    from app.services.watermark_detect import detect_timed_watermarks_hybrid
+    from app.services.watermark_detect import detect_timed_watermarks_hybrid, frame_prompts_at
 
     det = detect_timed_watermarks_hybrid(video_path)
     if not det.ok or not det.detections:
         return []
-    boxes = []
-    for d in det.detections:
-        f0 = int((d.start_s or 0.0) * fps)
-        f1 = int((d.end_s or total / fps) * fps)
-        if f0 <= frame_idx <= f1:
-            bx, by, bw, bh = d.box  # Detection.box is (x, y, w, h)
-            boxes.append([bx, by, bx + bw, by + bh])  # convert to x1,y1,x2,y2
-    return boxes
+    # Attribution filtering: tight direct evidence wins; interpolated boxes
+    # only on frames without their own sighting; clamped and capped per frame.
+    return frame_prompts_at(det.detections, frame_idx, fps, total)
 
 
 def run_e2e_gate(dataset_dir: str | Path, sample_frames: int = 2) -> dict:

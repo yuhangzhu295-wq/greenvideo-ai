@@ -162,6 +162,22 @@ def _probe_fps(path: Path) -> float:
         return 25.0
 
 
+def _probe_total_frames(path: Path) -> int:
+    """Frame count of a video, or 0 when unreadable."""
+    try:
+        import cv2
+
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            cap.release()
+            return 0
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        cap.release()
+        return max(0, total)
+    except Exception:
+        return 0
+
+
 def _region_coverage_pct(regions: list[MaskRegion], width: int = 0, height: int = 0) -> float:
     """Share of the frame covered by the union of the given regions."""
     if not regions:
@@ -706,6 +722,8 @@ async def _run_watermark_task_locked(
             # watermark becomes a prompt at its first active frame; SAM2 then
             # segments actual pixels and propagates across frames. The rectangle
             # is only a detection prompt / search window, never the repair mask.
+            # frame_prompts_at applies attribution filtering (tight direct
+            # evidence wins over inflated interpolations) and frame clamping.
             pixel_mask_prompts: dict[int, list[dict]] | None = None
             if (
                 payload.repair_mode == "ai"
@@ -714,14 +732,25 @@ async def _run_watermark_task_locked(
                 and getattr(detection, "detections", None)
             ):
                 try:
+                    from app.services.watermark_detect import frame_prompts_at
+
                     probe_fps = _probe_fps(source_path)
+                    probe_total = _probe_total_frames(source_path)
                     pixel_mask_prompts = {}
-                    for det in detection.detections:
-                        f0 = max(0, int((det.start_s or 0.0) * probe_fps))
-                        bx, by, bw, bh = det.box
-                        pixel_mask_prompts.setdefault(f0, []).append(
-                            {"box": [bx, by, bw, bh]}
-                        )
+                    seed_frames = sorted(
+                        {
+                            max(0, int((det.start_s or 0.0) * probe_fps))
+                            for det in detection.detections
+                        }
+                    )
+                    for f0 in seed_frames:
+                        for xyxy in frame_prompts_at(
+                            detection.detections, f0, probe_fps, probe_total
+                        ):
+                            x1, y1, x2, y2 = xyxy
+                            pixel_mask_prompts.setdefault(f0, []).append(
+                                {"box": [x1, y1, x2 - x1, y2 - y1]}
+                            )
                 except Exception:
                     pixel_mask_prompts = None
 

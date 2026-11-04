@@ -25,8 +25,11 @@ def _make_background(scene: str, h: int, w: int, t: float) -> np.ndarray:
     rng = np.random.RandomState(int(t * 1000) % 2**31)
     if scene == "grass":
         frame = np.full((h, w, 3), (40, 120, 40), dtype=np.uint8)
-        noise = rng.normal(0, 15, (h, w, 1)).astype(np.uint8)
-        frame = np.clip(frame.astype(int) + noise, 0, 255).astype(np.uint8)
+        # Zero-mean sensor noise applied in int space: casting the raw normal
+        # draw to uint8 wraps negatives to ~250 and turns the scene into a
+        # white strobe that no temporal filter can see through.
+        noise = rng.normal(0, 15, (h, w, 1)).astype(np.int16)
+        frame = np.clip(frame.astype(np.int16) + noise, 0, 255).astype(np.uint8)
     elif scene == "sky":
         frame = np.full((h, w, 3), (200, 180, 140), dtype=np.uint8)
         frame[: h // 3] = (230, 220, 190)
