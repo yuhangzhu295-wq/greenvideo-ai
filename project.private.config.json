@@ -2,7 +2,7 @@
   "libVersion": "3.16.1",
   "projectname": "greenvideo-ai",
   "setting": {
-    "urlCheck": true,
+    "urlCheck": false,
     "coverView": true,
     "lazyloadPlaceholderEnable": false,
     "skylineRenderEnable": false,

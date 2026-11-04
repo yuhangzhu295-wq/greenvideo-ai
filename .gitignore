@@ -30,9 +30,13 @@ htmlcov/
 .rn_temp/
 /apps/miniapp/dist/
 /apps/miniapp/dist-h5/
+/apps/miniapp/dist_h5/
 /apps/miniapp/.npm/
 /apps/miniapp/.rn_temp/
 
 # Storage
 storage/
 artifacts/
+.env
+recovery/
+work/

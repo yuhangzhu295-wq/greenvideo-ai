@@ -85,7 +85,7 @@ export async function parseVideo(inputText: string): Promise<ParseResult> {
       data: { text: inputText }
     });
   } catch (err) {
-    if (err instanceof Error && err.message === "DEMO_FALLBACK") {
+    if (IS_DEMO_MODE && err instanceof Error && err.message === "DEMO_FALLBACK") {
       return delay({ ...mockParseResult, id: inputText ? "parse_local_demo" : mockParseResult.id });
     }
     throw err;
@@ -102,7 +102,7 @@ export async function createDownloadTask(
       data: { parse_id: parseId, format_id: formatId }
     });
   } catch (err) {
-    if (err instanceof Error && err.message === "DEMO_FALLBACK") {
+    if (IS_DEMO_MODE && err instanceof Error && err.message === "DEMO_FALLBACK") {
       return delay({ task_id: "task_download_demo", status: "queued" });
     }
     throw err;
@@ -186,7 +186,7 @@ export async function getHistory(query: { type?: string; status?: string } | str
     const response = await request<{ items: HistoryItem[] }>(`/api/history${params ? `?${params}` : ""}`);
     return response.items;
   } catch (err) {
-    if (err instanceof Error && err.message === "DEMO_FALLBACK") return delay(mockHistory);
+    if (IS_DEMO_MODE && err instanceof Error && err.message === "DEMO_FALLBACK") return delay(mockHistory);
     throw err;
   }
 }
@@ -202,7 +202,7 @@ export async function submitFeedback(payload: FeedbackPayload): Promise<{ ok: bo
       data: payload
     });
   } catch (err) {
-    if (err instanceof Error && err.message === "DEMO_FALLBACK") {
+    if (IS_DEMO_MODE && err instanceof Error && err.message === "DEMO_FALLBACK") {
       return delay({ ok: true, id: "fb_demo" });
     }
     throw err;

@@ -150,3 +150,24 @@ def test_history_filter_delete_and_feedback() -> None:
 def test_file_path_traversal_protection() -> None:
     response = client.get("/api/files/%2e%2e%2fetc%2fpasswd")
     assert response.status_code in {400, 404}
+
+
+def test_canceled_task_status_barrier() -> None:
+    from app.db import get_task, insert_task, update_task
+
+    tid = "task_test_canceled_barrier"
+    insert_task(
+        {"id": tid, "type": "watermark", "status": "canceled", "progress": 50, "stage": "已取消"}
+    )
+
+    # Attempt to overwrite with completed
+    update_task(tid, status="completed", progress=100, stage="处理完成")
+    task = get_task(tid)
+    assert task is not None
+    assert task.status == "canceled"
+
+    # Attempt to overwrite with failed
+    update_task(tid, status="failed", progress=100, stage="处理失败", error="some error")
+    task = get_task(tid)
+    assert task is not None
+    assert task.status == "canceled"

@@ -2,7 +2,7 @@
   "miniprogramRoot": "dist/",
   "projectname": "GreenVideo AI",
   "description": "智能视频提取与处理",
-  "appid": "wx8026aeed4929d381",
+  "appid": "touristappid",
   "setting": {
     "urlCheck": false,
     "es6": true,

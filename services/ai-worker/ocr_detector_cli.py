@@ -1,6 +1,11 @@
 """CLI worker for PaddleOCR watermark detection in short videos."""
 from __future__ import annotations
 
+import os
+
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+
 import argparse
 import json
 import sys
@@ -14,6 +19,31 @@ PLATFORM_KEYWORDS = (
     "豆包", "剪映", "ai生成", "生成", "水印",
     "号", "id", "q ", "○", "作者", "布丁"
 )
+
+# Unambiguous platform identifiers: single-sighting persistence is ONLY allowed
+# for these strong keywords when placed near the frame border, never for short
+# generic strings like "id" or "号" that could match scene text.
+STRONG_PLATFORM_KEYWORDS = (
+    "tiktok", "douyin", "kuaishou", "bilibili", "小红书",
+    "抖音", "快手", "视频号", "微博", "豆包", "剪映"
+)
+
+def _levenshtein(s1: str, s2: str) -> int:
+    if len(s1) < len(s2):
+        return _levenshtein(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    prev = list(range(len(s2) + 1))
+    for c1 in s1:
+        curr = [prev[0] + 1]
+        for j, c2 in enumerate(s2):
+            insert = prev[j + 1] + 1
+            delete = curr[j] + 1
+            sub = prev[j] + (0 if c1 == c2 else 1)
+            curr.append(min(insert, delete, sub))
+        prev = curr
+    return prev[-1]
+
 
 def run_detection(video_path: str, end_frame: int | None = None, sample_sec: float = 1.0, raw: bool = False, start_frame: int = 0) -> list[dict]:
     cap = cv2.VideoCapture(video_path)
@@ -62,9 +92,11 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
         # scan (the dominant detection cost) roughly in half. Boxes are mapped
         # back to full-frame coordinates below via ocr_scale.
         ocr_scale = 1.0
-        if max(frame.shape[:2]) > 960:
-            ocr_scale = 960.0 / max(frame.shape[:2])
-            frame = cv2.resize(frame, None, fx=ocr_scale, fy=ocr_scale, interpolation=cv2.INTER_AREA)
+        if max(frame.shape[:2]) > 640:
+            ocr_scale = 640.0 / max(frame.shape[:2])
+            frame = cv2.resize(
+                frame, None, fx=ocr_scale, fy=ocr_scale, interpolation=cv2.INTER_AREA
+            )
 
         def _collect(img, out_list):
             """Run one OCR pass and append surviving candidates to out_list."""
@@ -91,7 +123,10 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
                     # Center check: scene content in the center (actor, clothes, props) should be protected
                     # unless it matches platform keywords (e.g. Douyin/Kuaishou search card or promo ID)
                     txt_lower = txt.lower()
-                    is_platform = any(k in txt_lower for k in PLATFORM_KEYWORDS)
+                    is_platform = any(k in txt_lower for k in PLATFORM_KEYWORDS) or any(
+                        _levenshtein(txt_lower, target) <= 2
+                        for target in ("bilibili", "tiktok", "kuaishou", "douyin")
+                    )
                     if in_center_safety_zone(bx1, by1, bw, bh) and not is_platform:
                         continue
                     if not is_platform and sc < 0.85:
@@ -152,6 +187,15 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
             clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
             lab[..., 0] = clahe.apply(lab[..., 0])
             _collect(cv2.cvtColor(lab, cv2.COLOR_LAB2BGR), raw_candidates)
+            frame_hits = len(raw_candidates) - before
+
+        # Third pass: Blue-channel intensity thresholding in raw dense trajectory mode.
+        # Catches semi-transparent white text fading into green/yellow foliage.
+        if raw and frame_hits == 0:
+            b_ch, _, _ = cv2.split(frame)
+            _, b_thresh = cv2.threshold(b_ch, 100, 255, cv2.THRESH_BINARY)
+            b_3ch = cv2.cvtColor(b_thresh, cv2.COLOR_GRAY2BGR)
+            _collect(b_3ch, raw_candidates)
                 
     cap.release()
 
@@ -209,23 +253,33 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
             })
             
     # Keep clusters with persistent presence and not spanning huge areas.
-    # A single high-confidence platform-keyword sighting is enough: a coarse
-    # sample can catch a corner watermark only once (sampling phase), and the
-    # caller then re-scans densely with the text as the tracker seed.
+    # Single-sighting persistence is ONLY granted to strong, unambiguous
+    # platform names with score>=0.9 (e.g. "tiktok", "douyin", "kuaishou") to
+    # catch corner watermarks that happened to coincide with only one sampling frame.
     results = []
     for c in clusters:
         best_score = max(c["scores"]) if c["scores"] else 0.0
         best_text = max(c["texts"], key=len) if c["texts"] else ""
-        is_platform_text = any(k in best_text.lower() for k in PLATFORM_KEYWORDS)
-        persistent = len(c["times"]) >= 2 or (best_score >= 0.9 and is_platform_text)
+        is_strong_platform = any(k in best_text.lower() for k in STRONG_PLATFORM_KEYWORDS)
+        persistent = len(c["times"]) >= 2 or (best_score >= 0.9 and is_strong_platform)
         if persistent:
-            # Detect a moving/floating watermark: member boxes spread far apart.
-            # A drifting anti-piracy watermark travels across the frame, so a
-            # single small envelope cannot cover it - the caller must track it.
-            xs = [b[0] + b[2] / 2.0 for b in c["member_boxes"]]
-            ys = [b[1] + b[3] / 2.0 for b in c["member_boxes"]]
-            spread_x = float(np.max(xs) - np.min(xs))
-            spread_y = float(np.max(ys) - np.min(ys))
+            # Detect a moving/floating watermark: compute the centroid of member boxes
+            # at each distinct sampling timestamp. If the watermark is truly travelling
+            # across the frame over time, its centroid coordinates will shift significantly.
+            # Multi-line stacked text in a static corner stays stationary at every timestamp.
+            t_to_boxes = {}
+            for t_val, b in zip(c["times"], c["member_boxes"]):
+                t_to_boxes.setdefault(t_val, []).append(b)
+            centroids_x = [
+                sum(b[0] + b[2] / 2.0 for b in b_list) / len(b_list)
+                for b_list in t_to_boxes.values()
+            ]
+            centroids_y = [
+                sum(b[1] + b[3] / 2.0 for b in b_list) / len(b_list)
+                for b_list in t_to_boxes.values()
+            ]
+            spread_x = float(np.max(centroids_x) - np.min(centroids_x)) if centroids_x else 0.0
+            spread_y = float(np.max(centroids_y) - np.min(centroids_y)) if centroids_y else 0.0
             is_moving = spread_x > max(60.0, width * 0.06) or spread_y > max(60.0, height * 0.06)
 
             # A watermark block in a corner frequently contains multiple vertically
@@ -262,19 +316,19 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
                 continue
             start_s = max(0.0, min(c["times"]) - 0.2)
             end_s = min(max_dur, max(c["times"]) + 1.2)
+            seed_idx = list(c["times"]).index(min(c["times"]))
+            sb = c["member_boxes"][seed_idx]
             results.append({
                 "box": [bx, by, bw, bh],
                 "start_s": round(start_s, 2),
                 "end_s": round(end_s, 2),
+                "times": [round(float(t), 2) for t in sorted(set(c["times"]))],
                 "confidence": round(float(np.mean(c["scores"])), 3),
                 "texts": list(set(c["texts"]))[:3],
                 "is_moving": is_moving,
                 # First sighting (smallest timestamp) with its tight box: the
                 # template used for dense tracking of a floating watermark.
-                "seed_box": [int(c["member_boxes"][list(c["times"]).index(min(c["times"]))][0]),
-                             int(c["member_boxes"][list(c["times"]).index(min(c["times"]))][1]),
-                             int(c["member_boxes"][list(c["times"]).index(min(c["times"]))][2]),
-                             int(c["member_boxes"][list(c["times"]).index(min(c["times"]))][3])],
+                "seed_box": [int(sb[0]), int(sb[1]), int(sb[2]), int(sb[3])],
                 "seed_time_s": round(float(min(c["times"])), 2),
             })
 

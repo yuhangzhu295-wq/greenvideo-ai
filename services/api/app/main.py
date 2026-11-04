@@ -103,8 +103,11 @@ def create_app() -> FastAPI:
 
     # Serve the built H5 app same-origin. MUST be registered last: a "/" mount
     # matches every path and would shadow any route registered after it.
-    dist_h5 = Path(__file__).resolve().parent.parent.parent.parent / "apps" / "miniapp" / "dist"
-    if dist_h5.is_dir():
+    miniapp_root = Path(__file__).resolve().parent.parent.parent.parent / "apps" / "miniapp"
+    dist_h5 = miniapp_root / "dist_h5"
+    if not (dist_h5.is_dir() and (dist_h5 / "index.html").exists()):
+        dist_h5 = miniapp_root / "dist"
+    if dist_h5.is_dir() and (dist_h5 / "index.html").exists():
         app.mount("/", StaticFiles(directory=dist_h5, html=True), name="h5")
 
     return app

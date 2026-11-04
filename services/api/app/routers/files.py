@@ -24,10 +24,9 @@ def get_file(file_id: str) -> FileResponse:
             status_code=404,
             detail={"code": "TASK_NOT_FOUND", "message": "任务不存在，无法提供下载文件。"},
         )
-    # A failed or canceled task must not hand back a file: the output of a
-    # failed repair can be the untouched input, which would look like a
-    # successful download to the user.
-    if task.status in {"failed", "canceled"}:
+    # Only completed or successful tasks can hand back output files.
+    # Processing, queued, failed, or canceled tasks must never provide downloads.
+    if task.status not in {"completed", "success"}:
         raise HTTPException(
             status_code=409,
             detail={
@@ -59,28 +58,42 @@ def get_file(file_id: str) -> FileResponse:
             },
         )
     if task.type in {"watermark", "download"}:
-        # Audio-only downloads (mp3) legitimately have no video frames, so the
-        # completeness check has to match the kind of file that was produced.
-        # Both branches verify decodable data rather than the header alone: a
-        # track that only exists in the container index is not a playable file,
-        # and a truncated file keeps advertising its original frame count.
-        audio_only = output_path.suffix.lower() in {".mp3", ".m4a", ".aac", ".wav", ".ogg"}
-        kind = "audio" if audio_only else "video"
-        from app.services.video_repair import media_integrity_issues
+        ext = output_path.suffix.lower()
+        is_audio = ext in {".mp3", ".m4a", ".aac", ".wav", ".ogg"}
+        is_image = ext in {".jpg", ".jpeg", ".png"}
 
-        try:
-            issues = media_integrity_issues(output_path, kind)
-        except Exception:
-            issues = ["无法校验输出文件完整性"]
-        if issues:
-            label = "音轨" if audio_only else "视频"
-            raise HTTPException(
-                status_code=409,
+        if is_image:
+            import cv2
+
+            img = cv2.imread(str(output_path))
+            if img is None or img.size == 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "OUTPUT_NOT_PLAYABLE",
+                        "message": "输出图片损坏或无法解码，请重新执行处理任务。",
+                    },
+                )
+        else:
+            kind = "audio" if is_audio else "video"
+            from app.services.video_repair import media_integrity_issues
+
+            try:
+                issues = media_integrity_issues(output_path, kind)
+            except Exception:
+                issues = ["无法校验输出文件完整性"]
+            if issues:
+                label = "音轨" if is_audio else "视频"
+                raise HTTPException(
+                    status_code=409,
                 detail={
                     "code": "OUTPUT_NOT_PLAYABLE",
-                    "message": f"输出文件的{label}不完整，请重新执行处理任务：" + "；".join(issues),
+                    "message": (
+                        f"输出文件的{label}不完整，请重新执行处理任务："
+                        + "；".join(issues)
+                    ),
                 },
-            )
+                )
     return FileResponse(output_path, filename=output_path.name)
 
 
@@ -97,6 +110,11 @@ def get_tracking_preview_file(file_id: str) -> FileResponse:
             status_code=404,
             detail={"code": "TASK_NOT_FOUND", "message": "任务不存在。"},
         )
+    if task.status in {"failed", "canceled"}:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "TASK_NOT_SUCCESSFUL", "message": "任务已失败或取消，不提供追踪预览。"},
+        )
     from app.services.storage import storage_path
 
     preview_path = storage_path("files", f"tracking_{file_id}.mp4")
@@ -104,6 +122,20 @@ def get_tracking_preview_file(file_id: str) -> FileResponse:
         raise HTTPException(
             status_code=404,
             detail={"code": "PREVIEW_NOT_READY", "message": "追踪预览视频尚未生成或不可用。"},
+        )
+    from app.services.video_repair import media_integrity_issues
+
+    try:
+        issues = media_integrity_issues(preview_path, "video")
+    except Exception:
+        issues = ["无法校验追踪预览视频完整性"]
+    if issues:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "OUTPUT_NOT_PLAYABLE",
+                "message": "追踪预览视频损坏或不完整：" + "；".join(issues),
+            },
         )
     return FileResponse(preview_path, media_type="video/mp4", filename=f"tracking_{file_id}.mp4")
 

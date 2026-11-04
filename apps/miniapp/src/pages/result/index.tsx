@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { Button, Text, View } from "@tarojs/components";
 import Taro from "@tarojs/taro";
-import { createDownloadTask, mockParseResult } from "@/api/client";
+import { createDownloadTask } from "@/api/client";
 import type { ParseResult } from "@/api/types";
 import { BrandHeader, Card, IconBadge, PageShell, SectionTitle, navigate } from "@/components";
 
@@ -12,7 +12,7 @@ function durationText(seconds: number) {
 }
 
 export default function ResultPage() {
-  const [result, setResult] = useState<ParseResult>(mockParseResult);
+  const [result, setResult] = useState<ParseResult | null>(null);
   const [loadingFormat, setLoadingFormat] = useState("");
   const [lastTaskId, setLastTaskId] = useState("");
 
@@ -22,6 +22,7 @@ export default function ResultPage() {
   }, []);
 
   async function download(formatId: string) {
+    if (!result) return;
     setLoadingFormat(formatId);
     try {
       const task = await createDownloadTask(result.id, formatId);
@@ -41,6 +42,24 @@ export default function ResultPage() {
       return;
     }
     await Taro.setClipboardData({ data: `/api/files/${lastTaskId}` });
+  }
+
+  if (!result) {
+    return (
+      <PageShell active='home'>
+        <BrandHeader brand subtitle='智能视频提取与处理' hero='video' />
+        <Card className='result-card'>
+          <View style={{ textAlign: "center", padding: "40px 20px" }}>
+            <View style={{ fontSize: "16px", color: "#666", marginBottom: "20px" }}>
+              暂无解析结果，请从首页输入视频链接后重试。
+            </View>
+            <Button className='small-primary' onClick={() => navigate("/pages/home/index")}>
+              返回首页
+            </Button>
+          </View>
+        </Card>
+      </PageShell>
+    );
   }
 
   return (

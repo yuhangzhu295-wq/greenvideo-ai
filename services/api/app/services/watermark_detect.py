@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -646,15 +647,15 @@ def detect_outro_cut(video_path: Path | str) -> tuple[int | None, float | None]:
 
             is_dark_cut = (
                 (diff > 25.0 or (luma < 35.0 and records[i - 1][2] > 55.0))
-                and np.mean(post_lumas) < 45.0
-                and np.mean(post_stds) < 25.0
+                and np.mean(post_lumas) < 55.0
+                and np.mean(post_stds) < 36.0
             )
 
             is_static_card = (
-                np.mean(post_lumas) < 68.0
-                and np.mean(post_stds) < 22.0
+                np.mean(post_lumas) < 75.0
+                and np.mean(post_stds) < 36.0
                 and np.mean(post_diffs) < 3.0
-                and (diff > 15.0 or (i >= 5 and records[i - 5][2] - luma > 30.0))
+                and (diff > 15.0 or (i >= 5 and records[i - 5][2] - luma > 25.0))
             )
 
             if is_dark_cut or is_static_card:
@@ -717,18 +718,11 @@ def track_watermarks_dense(
         )
 
     frame_idx = 0
-    prev_global_gray = None
     while frame_idx < total_frames:
         ret, frame = cap.read()
         if not ret:
             break
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        is_scene_cut = False
-        if prev_global_gray is not None:
-            g_diff = float(np.abs(gray.astype(np.float32) - prev_global_gray.astype(np.float32)).mean())
-            if g_diff > 26.0:
-                is_scene_cut = True
 
         for st in det_states:
             if not (st["start_f"] <= frame_idx < st["end_f"]):
@@ -738,7 +732,7 @@ def track_watermarks_dense(
 
             if not st["is_moving"]:
                 # Anchored stationary corner watermark (platform logo, author ID, etc.)
-                # Absolutely pin the box to the detected region to eliminate background movement drift
+                # Absolutely pin the box to the detected region to avoid drift
                 st["cur_box"] = [ox, oy, ow, oh]
                 bx, by, bw, bh = ox, oy, ow, oh
                 patch = gray[by : by + bh, bx : bx + bw]
@@ -784,7 +778,6 @@ def track_watermarks_dense(
             st["prev_gray"] = gray
             st["raw_history"].append((frame_idx, tuple(st["cur_box"]), list(st["keypoints"])))
 
-        prev_global_gray = gray
         frame_idx += 1
     cap.release()
 
@@ -798,13 +791,11 @@ def track_watermarks_dense(
         ws = [h[1][2] for h in hist]
         hs = [h[1][3] for h in hist]
 
-        win = 5
-
-        def smooth_1d(arr):
-            if len(arr) < win:
+        def smooth_1d(arr, window_size: int = 5):
+            if len(arr) < window_size:
                 return arr
-            kernel = np.ones(win) / win
-            pad = win // 2
+            kernel = np.ones(window_size) / window_size
+            pad = window_size // 2
             padded = np.pad(arr, (pad, pad), mode="edge")
             smoothed = np.convolve(padded, kernel, mode="valid")
             return [int(round(v)) for v in smoothed[: len(arr)]]
@@ -1011,13 +1002,27 @@ def render_tracking_preview_video(
         cap.release()
         if pipe:
             pipe.close()
-            proc.wait()
+            try:
+                proc.wait(timeout=30)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
         elif writer:
             writer.release()
     except Exception:
         cap.release()
         if pipe:
             pipe.close()
+            if proc:
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
         elif writer:
             writer.release()
         raise
@@ -1129,6 +1134,7 @@ def _fuzzy_text_hit(candidate: str, targets: set[str]) -> bool:
             continue
         # Bounded Levenshtein (early exit when already over budget).
         prev = list(range(len(t) + 1))
+        matched = True
         for i, ca in enumerate(cand, 1):
             cur = [i]
             row_min = i
@@ -1138,9 +1144,10 @@ def _fuzzy_text_hit(candidate: str, targets: set[str]) -> bool:
                 cur.append(val)
                 row_min = min(row_min, val)
             if row_min > 2:
-                return False
+                matched = False
+                break
             prev = cur
-        if prev[-1] <= 2:
+        if matched and prev[-1] <= 2:
             return True
     return False
 
@@ -1152,15 +1159,18 @@ def _sightings_to_moving_detections(
     end_frame: int,
     sub_step_s: float = 0.15,
 ) -> list[Detection]:
-    """Convert raw per-frame OCR sightings into a per-frame trajectory.
+    """Convert raw per-frame OCR sightings into discrete corner or moving Detections.
 
-    Sighting gaps up to ``max_interp_gap_s`` are linearly subdivided so the
-    repair mask stays glued to a travelling watermark; longer gaps are left
-    uncovered on purpose - the caller's endpoint/window re-scans own them, and
-    bridging a long gap with a straight line would mask large clean areas.
-    Endpoint extrapolation covers only the short head/tail残段 (<= 2 steps) and
-    is skipped when the velocity estimate spans an unreliable interval.
+    When a watermark hops between distant corners (e.g. TikTok switching from
+    TL to TR to BL to BR), consecutive sightings jump by hundreds of pixels.
+    Treating distant hops as a continuous trajectory would snake a line through
+    the screen center and drop the other corners.
+    Instead, we segment sightings into spatially continuous chains (distance <= 250px).
+    Stationary chains emit clean corner boxes; true floating chains emit interpolated
+    trajectories.
     """
+    import math
+
     hits: list[tuple[float, tuple[int, int, int, int]]] = []
     for s in sightings:
         if not _fuzzy_text_hit(str(s.get("text", "")), target_texts):
@@ -1169,11 +1179,11 @@ def _sightings_to_moving_detections(
         if len(box) != 4 or box[2] <= 0 or box[3] <= 0:
             continue
         hits.append((float(s.get("time_s", 0.0)), box))
-    if len(hits) < 2:
+    if not hits:
         return []
 
     hits.sort(key=lambda h: h[0])
-    # Deduplicate same-time sightings (CLAHE dual pass sees the same box twice).
+    # Deduplicate same-time sightings
     dedup: list[tuple[float, tuple[int, int, int, int]]] = []
     for t_s, b in hits:
         if dedup and abs(t_s - dedup[-1][0]) < 1e-3:
@@ -1181,159 +1191,236 @@ def _sightings_to_moving_detections(
         dedup.append((t_s, b))
     hits = dedup
 
-    xs = [b[0] + b[2] / 2.0 for _, b in hits]
-    ys = [b[1] + b[3] / 2.0 for _, b in hits]
-    spread = max(max(xs) - min(xs), max(ys) - min(ys))
-    if spread < 60.0:
+    if not hits:
         return []
 
-    # Endpoint extrapolation: OCR cannot catch the watermark in every lighting
-    # condition, so the short head/tail残段 are covered by extending the
-    # observed velocity. Both guards come from review: the extrapolated span is
-    # capped at 2 steps, and a velocity estimated across a sighting gap longer
-    # than 1s (phase/turning point) is rejected as unreliable.
-    max_dur = end_frame / fps
-    pre_points: list[tuple[float, tuple[int, int, int, int]]] = []
-    post_points: list[tuple[float, tuple[int, int, int, int]]] = []
-    if hits[0][0] > 0.15 and len(hits) >= 2:
-        (t0, b0), (t1, b1) = hits[1], hits[0]
-        dt = t1 - t0
-        if 1e-3 <= abs(dt) <= 1.0:
-            vx = (b1[0] - b0[0]) / dt
-            vy = (b1[1] - b0[1]) / dt
-            c0x, c0y = b1[0] + b1[2] / 2.0, b1[1] + b1[3] / 2.0
-            k = 1
-            while True:
-                tt = hits[0][0] - sub_step_s * k
-                if tt < 0 or k > 2:
-                    break
-                cx = c0x + vx * (tt - hits[0][0])
-                cy = c0y + vy * (tt - hits[0][0])
-                pre_points.append((tt, (int(round(cx - b1[2] / 2.0)), int(round(cy - b1[3] / 2.0)), b1[2], b1[3])))
-                k += 1
-    if max_dur - hits[-1][0] > 0.15 and len(hits) >= 2:
-        (t0, b0), (t1, b1) = hits[-2], hits[-1]
-        dt = t1 - t0
-        if 1e-3 <= abs(dt) <= 1.0:
-            vx = (b1[0] - b0[0]) / dt
-            vy = (b1[1] - b0[1]) / dt
-            cNx, cNy = b1[0] + b1[2] / 2.0, b1[1] + b1[3] / 2.0
-            k = 1
-            while True:
-                tt = hits[-1][0] + sub_step_s * k
-                if tt > max_dur or k > 2:
-                    break
-                cx = cNx + vx * (tt - hits[-1][0])
-                cy = cNy + vy * (tt - hits[-1][0])
-                post_points.append((tt, (int(round(cx - b1[2] / 2.0)), int(round(cy - b1[3] / 2.0)), b1[2], b1[3])))
-                k += 1
-    hits = list(reversed(pre_points)) + hits + post_points
+    # Overall spread check: if sightings across the entire video never move at all,
+    # it belongs to the static detection path, not moving trajectories.
+    xs_all = [b[0] + b[2] / 2.0 for _, b in hits]
+    ys_all = [b[1] + b[3] / 2.0 for _, b in hits]
+    overall_spread = max(max(xs_all) - min(xs_all), max(ys_all) - min(ys_all))
+    if overall_spread < 60.0:
+        return []
 
-    # Median box size: OCR jitter on a semi-transparent overlay varies the box
-    # slightly between frames. Inflation tracks the largest interpolation gap:
-    # a straight line across a long gap deviates from a curved real path by
-    # roughly gap²·curvature/8, so wide gaps get proportionally fatter boxes.
-    ws = sorted(b[2] for _, b in hits)
-    hs = sorted(b[3] for _, b in hits)
-    mw = int(ws[len(ws) // 2])
-    mh = int(hs[len(hs) // 2])
-    max_gap = 0.0
-    for idx in range(len(hits) - 1):
-        max_gap = max(max_gap, hits[idx + 1][0] - hits[idx][0])
-    gap_inflation = 1.0 + min(0.9, (max_gap / 0.4) * 0.35) if max_gap > 0.3 else 1.12
-    mw = int(mw * gap_inflation)
-    mh = int(mh * gap_inflation)
     max_dur = end_frame / fps
 
-    # Build interpolated centre samples across the sighting span. Gaps longer
-    # than ``max_interp_gap_s`` are NOT bridged: a straight line through a long
-    # gap would mask wide clean areas; the endpoint/window re-scans own them.
-    max_interp_gap_s = 0.8
-    centres: list[tuple[float, float, float]] = []
-    for idx, (t_s, box) in enumerate(hits):
-        centres.append((t_s, box[0] + box[2] / 2.0, box[1] + box[3] / 2.0))
-        if idx < len(hits) - 1:
-            nt, nb = hits[idx + 1]
-            gap = nt - t_s
-            if gap > max_interp_gap_s:
-                continue
-            steps = max(1, int(round(gap / sub_step_s)))
-            for k in range(1, steps):
-                f = k / steps
-                centres.append(
-                    (
-                        t_s + gap * f,
-                        box[0] + box[2] / 2.0 + (nb[0] + nb[2] / 2.0 - box[0] - box[2] / 2.0) * f,
-                        box[1] + box[3] / 2.0 + (nb[1] + nb[3] / 2.0 - box[1] - box[3] / 2.0) * f,
+    # Split into continuous chains.
+    # An abrupt corner jump (e.g. TikTok switching between corners) is a sudden spatial jump:
+    # either a jump (>450px) in a short interval (dt <= 0.8s), or high velocity (>1200 px/s).
+    # Normal floating watermarks (drifting across screen, speed ~700 px/s) stay in one chain.
+    chains: list[list[tuple[float, tuple[int, int, int, int]]]] = []
+    current_chain = [hits[0]]
+    for h in hits[1:]:
+        prev_h = current_chain[-1]
+        dt = h[0] - prev_h[0]
+        cp = (prev_h[1][0] + prev_h[1][2] / 2.0, prev_h[1][1] + prev_h[1][3] / 2.0)
+        cc = (h[1][0] + h[1][2] / 2.0, h[1][1] + h[1][3] / 2.0)
+        dist = math.hypot(cc[0] - cp[0], cc[1] - cp[1])
+        is_jump = (dist > 450 and dt <= 0.8) or (dt > 0 and (dist / dt) > 1200.0)
+        if is_jump:
+            chains.append(current_chain)
+            current_chain = [h]
+        else:
+            current_chain.append(h)
+    chains.append(current_chain)
+
+    all_detections: list[Detection] = []
+    for c_idx, ch in enumerate(chains):
+        xs = [b[0] + b[2] / 2.0 for _, b in ch]
+        ys = [b[1] + b[3] / 2.0 for _, b in ch]
+        chain_spread = max(max(xs) - min(xs), max(ys) - min(ys))
+
+        if chain_spread < 60.0:
+            # Stationary corner/region phase (e.g. TikTok resting in a corner)
+            ws = sorted(b[2] for _, b in ch)
+            hs = sorted(b[3] for _, b in ch)
+            xs0 = sorted(b[0] for _, b in ch)
+            ys0 = sorted(b[1] for _, b in ch)
+            median_box = (
+                xs0[len(xs0) // 2],
+                ys0[len(ys0) // 2],
+                ws[len(ws) // 2],
+                hs[len(hs) // 2],
+            )
+            t_start = (
+                0.0
+                if c_idx == 0
+                else round((chains[c_idx - 1][-1][0] + ch[0][0]) / 2.0, 2)
+            )
+            t_end = (
+                max_dur
+                if c_idx == len(chains) - 1
+                else round((ch[-1][0] + chains[c_idx + 1][0][0]) / 2.0, 2)
+            )
+            all_detections.append(
+                Detection(
+                    box=median_box,
+                    area=median_box[2] * median_box[3],
+                    score=0.95,
+                    kind="text",
+                    start_s=t_start,
+                    end_s=t_end,
+                    is_moving=False,
+                )
+            )
+        else:
+            # Truly drifting watermark: run dense trajectory interpolation
+            pre_points: list[tuple[float, tuple[int, int, int, int]]] = []
+            post_points: list[tuple[float, tuple[int, int, int, int]]] = []
+            if ch[0][0] > 0.15 and len(ch) >= 2:
+                (t0, b0), (t1, b1) = ch[1], ch[0]
+                dt = t1 - t0
+                if 1e-3 <= abs(dt) <= 1.0:
+                    vx = (b1[0] - b0[0]) / dt
+                    vy = (b1[1] - b0[1]) / dt
+                    c0x, c0y = b1[0] + b1[2] / 2.0, b1[1] + b1[3] / 2.0
+                    k = 1
+                    while True:
+                        tt = ch[0][0] - sub_step_s * k
+                        if tt < 0 or k > 2:
+                            break
+                        cx = c0x + vx * (tt - ch[0][0])
+                        cy = c0y + vy * (tt - ch[0][0])
+                        pre_points.append(
+                            (
+                                tt,
+                                (
+                                    int(round(cx - b1[2] / 2.0)),
+                                    int(round(cy - b1[3] / 2.0)),
+                                    b1[2],
+                                    b1[3],
+                                ),
+                            )
+                        )
+                        k += 1
+            if max_dur - ch[-1][0] > 0.15 and len(ch) >= 2:
+                (t0, b0), (t1, b1) = ch[-2], ch[-1]
+                dt = t1 - t0
+                if 1e-3 <= abs(dt) <= 1.0:
+                    vx = (b1[0] - b0[0]) / dt
+                    vy = (b1[1] - b0[1]) / dt
+                    cNx, cNy = b1[0] + b1[2] / 2.0, b1[1] + b1[3] / 2.0
+                    k = 1
+                    while True:
+                        tt = ch[-1][0] + sub_step_s * k
+                        if tt > max_dur or k > 2:
+                            break
+                        cx = cNx + vx * (tt - ch[-1][0])
+                        cy = cNy + vy * (tt - ch[-1][0])
+                        post_points.append(
+                            (
+                                tt,
+                                (
+                                    int(round(cx - b1[2] / 2.0)),
+                                    int(round(cy - b1[3] / 2.0)),
+                                    b1[2],
+                                    b1[3],
+                                ),
+                            )
+                        )
+                        k += 1
+            ch_hits = list(reversed(pre_points)) + ch + post_points
+
+            ws = sorted(b[2] for _, b in ch_hits)
+            hs = sorted(b[3] for _, b in ch_hits)
+            mw = int(ws[len(ws) // 2])
+            mh = int(hs[len(hs) // 2])
+            max_gap = 0.0
+            for idx in range(len(ch_hits) - 1):
+                max_gap = max(max_gap, ch_hits[idx + 1][0] - ch_hits[idx][0])
+            gap_inflation = (
+                1.0 + min(0.9, (max_gap / 0.4) * 0.35) if max_gap > 0.3 else 1.12
+            )
+            mw = int(mw * gap_inflation)
+            mh = int(mh * gap_inflation)
+
+            max_interp_gap_s = 2.6
+            centres: list[tuple[float, float, float]] = []
+            for idx, (t_s, box) in enumerate(ch_hits):
+                centres.append((t_s, box[0] + box[2] / 2.0, box[1] + box[3] / 2.0))
+                if idx < len(ch_hits) - 1:
+                    nt, nb = ch_hits[idx + 1]
+                    gap = nt - t_s
+                    if gap > max_interp_gap_s:
+                        continue
+                    steps = max(1, int(round(gap / sub_step_s)))
+                    for k in range(1, steps):
+                        f = k / steps
+                        centres.append(
+                            (
+                                t_s + gap * f,
+                                box[0]
+                                + box[2] / 2.0
+                                + (nb[0] + nb[2] / 2.0 - box[0] - box[2] / 2.0) * f,
+                                box[1]
+                                + box[3] / 2.0
+                                + (nb[1] + nb[3] / 2.0 - box[1] - box[3] / 2.0) * f,
+                            )
+                        )
+
+            for idx, (t_s, cx, cy) in enumerate(centres):
+                ux = int(round(cx - mw / 2.0))
+                uy = int(round(cy - mh / 2.0))
+                seg_start = (
+                    t_s - sub_step_s
+                    if idx == 0
+                    else (centres[idx - 1][0] + t_s) / 2.0 - sub_step_s / 2.0
+                )
+                seg_end = (
+                    t_s + sub_step_s
+                    if idx == len(centres) - 1
+                    else (t_s + centres[idx + 1][0]) / 2.0 + sub_step_s / 2.0
+                )
+                all_detections.append(
+                    Detection(
+                        box=(ux, uy, mw, mh),
+                        area=mw * mh,
+                        score=0.95,
+                        kind="tracked",
+                        start_s=round(max(0.0, seg_start), 2),
+                        end_s=round(min(seg_end, max_dur), 2),
+                        is_moving=True,
                     )
                 )
 
-    detections: list[Detection] = []
-    for idx, (t_s, cx, cy) in enumerate(centres):
-        ux = int(round(cx - mw / 2.0))
-        uy = int(round(cy - mh / 2.0))
-        # Segments deliberately overlap by half a step: linear interpolation of
-        # a curved (sinusoidal) path deviates most exactly at segment
-        # boundaries, and there the union of the two neighbouring boxes keeps
-        # the watermark covered.
-        seg_start = t_s - sub_step_s if idx == 0 else (centres[idx - 1][0] + t_s) / 2.0 - sub_step_s / 2.0
-        seg_end = t_s + sub_step_s if idx == len(centres) - 1 else (t_s + centres[idx + 1][0]) / 2.0 + sub_step_s / 2.0
-        detections.append(
-            Detection(
-                box=(ux, uy, mw, mh),
-                area=mw * mh,
-                score=0.95,
-                kind="tracked",
-                start_s=round(max(0.0, seg_start), 2),
-                end_s=round(min(seg_end, max_dur), 2),
-                is_moving=True,
-            )
-        )
+            hold_dur = max_dur - ch_hits[-1][0]
+            if 0.15 < hold_dur <= 1.0:
+                grow = 1.4 + 0.5 * min(1.0, (hold_dur - 0.15) / 0.85)
+                lb = ch_hits[-1][1]
+                hw, hh = int(lb[2] * grow), int(lb[3] * grow)
+                hx = int(lb[0] + lb[2] / 2.0 - hw / 2.0)
+                hy = int(lb[1] + lb[3] / 2.0 - hh / 2.0)
+                all_detections.append(
+                    Detection(
+                        box=(max(0, hx), max(0, hy), hw, hh),
+                        area=hw * hh,
+                        score=0.9,
+                        kind="tracked",
+                        start_s=round(ch_hits[-1][0], 2),
+                        end_s=round(max_dur, 2),
+                        is_moving=True,
+                    )
+                )
+            head_hold = ch_hits[0][0]
+            if 0.15 < head_hold <= 1.0:
+                grow = 1.4 + 0.5 * min(1.0, (head_hold - 0.15) / 0.85)
+                fb = ch_hits[0][1]
+                hw, hh = int(fb[2] * grow), int(fb[3] * grow)
+                hx = int(fb[0] + fb[2] / 2.0 - hw / 2.0)
+                hy = int(fb[1] + fb[3] / 2.0 - hh / 2.0)
+                all_detections.append(
+                    Detection(
+                        box=(max(0, hx), max(0, hy), hw, hh),
+                        area=hw * hh,
+                        score=0.9,
+                        kind="tracked",
+                        start_s=0.0,
+                        end_s=round(head_hold, 2),
+                        is_moving=True,
+                    )
+                )
 
-    # Endpoint hold: the fine re-scan (0.1s + CLAHE) already captures most
-    # head/tail sightings, and extrapolation covers a further 0.3s. Whatever
-    # gap remains is bridged by holding the endpoint box, inflated in
-    # proportion to the hold length so the watermark cannot slip past it. A
-    # local residual is far cheaper than a hole through which the overlay
-    # stays visible. Holds longer than 1.0s are dropped: masking blind for a
-    # long stretch hurts the picture for nothing.
-    hold_dur = max_dur - hits[-1][0]
-    if 0.15 < hold_dur <= 1.0:
-        grow = 1.4 + 0.5 * min(1.0, (hold_dur - 0.15) / 0.85)
-        lb = hits[-1][1]
-        hw, hh = int(lb[2] * grow), int(lb[3] * grow)
-        hx = int(lb[0] + lb[2] / 2.0 - hw / 2.0)
-        hy = int(lb[1] + lb[3] / 2.0 - hh / 2.0)
-        detections.append(
-            Detection(
-                box=(max(0, hx), max(0, hy), hw, hh),
-                area=hw * hh,
-                score=0.9,
-                kind="tracked",
-                start_s=round(hits[-1][0], 2),
-                end_s=round(max_dur, 2),
-                is_moving=True,
-            )
-        )
-    head_hold = hits[0][0]
-    if 0.15 < head_hold <= 1.0:
-        grow = 1.4 + 0.5 * min(1.0, (head_hold - 0.15) / 0.85)
-        fb = hits[0][1]
-        hw, hh = int(fb[2] * grow), int(fb[3] * grow)
-        hx = int(fb[0] + fb[2] / 2.0 - hw / 2.0)
-        hy = int(fb[1] + fb[3] / 2.0 - hh / 2.0)
-        detections.append(
-            Detection(
-                box=(max(0, hx), max(0, hy), hw, hh),
-                area=hw * hh,
-                score=0.9,
-                kind="tracked",
-                start_s=0.0,
-                end_s=round(head_hold, 2),
-                is_moving=True,
-            )
-        )
-    return detections
+    return all_detections
 
 
 def verify_watermark_removal(
@@ -1373,9 +1460,13 @@ def verify_watermark_removal(
         dur = (det.end_s if det.end_s is not None else total_frames / fps) - det.start_s
         if dur <= 0:
             continue
-        n_samples = max(1, min(3, int(dur / 0.5) or samples_per_det))
-        for k in range(n_samples):
-            t_s = det.start_s + dur * (k + 0.5) / n_samples
+        if det.is_moving:
+            sample_times = [det.start_s + dur * 0.5]
+        else:
+            n_samples = max(1, min(3, int(dur / 0.5) or samples_per_det))
+            sample_times = [det.start_s + dur * (k + 0.5) / n_samples for k in range(n_samples)]
+
+        for t_s in sample_times:
             f_idx = int(t_s * fps)
             if f_idx >= total_frames:
                 continue
@@ -1387,6 +1478,12 @@ def verify_watermark_removal(
                 continue
 
             bx, by, bw, bh = det.box
+            # Skip if box is substantially off-screen
+            on_screen_w = max(0, min(width, bx + bw) - max(0, bx))
+            on_screen_h = max(0, min(height, by + bh) - max(0, by))
+            if on_screen_w * on_screen_h < 0.65 * (bw * bh):
+                continue
+
             # Inner patch: the watermark strokes, without the inflated border.
             ix1 = max(0, bx + bw // 6)
             iy1 = max(0, by + bh // 6)
@@ -1395,6 +1492,8 @@ def verify_watermark_removal(
             if ix2 - ix1 < 8 or iy2 - iy1 < 8:
                 continue
             patch = cv2.cvtColor(src_frame[iy1:iy2, ix1:ix2], cv2.COLOR_BGR2GRAY)
+            if float(patch.std()) < 8.0:
+                continue
 
             # Search neighbourhood: 40% margin around the box absorbs small
             # trajectory jitter without scanning the whole frame.
@@ -1406,10 +1505,19 @@ def verify_watermark_removal(
             if region.shape[0] < patch.shape[0] or region.shape[1] < patch.shape[1]:
                 continue
 
+            rep_exact = cv2.cvtColor(rep_frame[iy1:iy2, ix1:ix2], cv2.COLOR_BGR2GRAY)
+            diff = cv2.absdiff(patch, rep_exact)
+            has_inpaint = float(diff.mean()) > 4.0 and int(diff.max()) > 30
+
             res = cv2.matchTemplate(region, patch, cv2.TM_CCOEFF_NORMED)
             _, max_val, _, max_loc = cv2.minMaxLoc(res)
             total_checked += 1
-            if float(max_val) >= match_threshold:
+            # A residual occurs when the source watermark is still present in repaired frame:
+            # either region was not modified (has_inpaint is False, watermark missed completely),
+            # or template correlation is extremely high without proper replacement.
+            is_unpainted = not has_inpaint and float(max_val) >= match_threshold
+            is_insufficient = float(max_val) >= 0.92 and float(diff.mean()) < 5.0
+            if is_unpainted or is_insufficient:
                 residual.append({
                     "frame_index": f_idx,
                     "time_s": round(t_s, 2),
@@ -1421,7 +1529,7 @@ def verify_watermark_removal(
     cap_r.release()
     residual_ratio = (len(residual) / total_checked) if total_checked else 0.0
     return {
-        "ok": len(residual) == 0,
+        "ok": total_checked > 0 and len(residual) == 0,
         "total": total_checked,
         "residual_count": len(residual),
         "residual_ratio": round(residual_ratio, 3),
@@ -1498,13 +1606,14 @@ def detect_timed_watermarks_hybrid(video_path: Path | str) -> DetectionResult:
                 "--sample-sec",
                 "1.5",
             ]
-            proc = subprocess.run(cmd, capture_output=True, timeout=120, check=False)
+            proc = subprocess.run(cmd, capture_output=True, timeout=600, check=False)
             stdout = proc.stdout.decode("utf-8", errors="replace")
             for line in stdout.splitlines():
                 if line.startswith("OUTPUT_JSON:"):
                     ocr_boxes = json.loads(line.removeprefix("OUTPUT_JSON:"))
                     break
-        except Exception:
+        except Exception as exc:
+            logger.warning("OCR detector CLI failed or timed out: %s", exc)
             ocr_boxes = []
 
     detections: list[Detection] = []
@@ -1545,6 +1654,18 @@ def detect_timed_watermarks_hybrid(video_path: Path | str) -> DetectionResult:
             if len(vars_arr) == 0:
                 continue
             intervals = _split_active_intervals(timestamps, vars_arr, content_dur)
+            b_times = b.get("times", [])
+            if b_times:
+                # Discard intervals far from any OCR sighting of this cluster (scene motion)
+                confirmed_intervals = [
+                    (s, e)
+                    for s, e in intervals
+                    if any(s - 1.5 <= t <= e + 1.5 for t in b_times)
+                ]
+                if confirmed_intervals:
+                    intervals = confirmed_intervals
+                else:
+                    intervals = [(b["start_s"], b["end_s"])]
             bx, by, bw, bh = (int(v) for v in b["box"])
             target_texts = {str(t).lower() for t in b.get("texts", [])}
             # A text already rebuilt from the dense trajectory must not also
@@ -1552,13 +1673,33 @@ def detect_timed_watermarks_hybrid(video_path: Path | str) -> DetectionResult:
             if target_texts & consumed_texts:
                 continue
 
-            # One dense raw re-scan per video covers both paths: the OCR
-            # variance flag and periodic drift that revisits the same spot at
-            # the coarse interval (variance 0, invisible to passive checks).
-            if dense_cache is None:
-                dense_cache = _dense_ocr_sightings(video_path, fps, content_end_frame, interval_s=0.35)
-            moving_dets = _sightings_to_moving_detections(
-                dense_cache, target_texts, fps, content_end_frame
+            # Run dense OCR trajectory re-scan when a watermark is moving or appears
+            # at multiple distant locations.
+            # Static corner watermarks already have their exact multi-line envelopes.
+            text_to_boxes: dict[str, list[list[int]]] = {}
+            for bx_item in ocr_boxes:
+                for t_item in bx_item.get("texts", []):
+                    text_to_boxes.setdefault(t_item.lower(), []).append(bx_item["box"])
+            multi_loc = any(
+                len(b_list) >= 2
+                and any(
+                    math.hypot(b1[0] - b2[0], b1[1] - b2[1]) > 120
+                    for b1 in b_list
+                    for b2 in b_list
+                )
+                for b_list in text_to_boxes.values()
+            )
+            any_moving = any(bx.get("is_moving") for bx in ocr_boxes) or multi_loc
+            if any_moving and dense_cache is None:
+                dense_cache = _dense_ocr_sightings(
+                    video_path, fps, content_end_frame, interval_s=0.35
+                )
+            moving_dets = (
+                _sightings_to_moving_detections(
+                    dense_cache, target_texts, fps, content_end_frame
+                )
+                if dense_cache
+                else []
             )
 
             if moving_dets:

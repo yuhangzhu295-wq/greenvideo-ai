@@ -102,6 +102,13 @@ def seed_demo_data() -> None:
         if count:
             return
 
+        import os
+
+        # Never seed fake history in production or default environments.
+        # History must only be populated by genuine user tasks.
+        if os.getenv("GREENVIDEO_DEMO_MODE", "false").lower() != "true":
+            return
+
         items = [
             HistoryItem(
                 id="hist_aurora",
@@ -129,7 +136,7 @@ def seed_demo_data() -> None:
                 title="城市夜景4K素材",
                 kind="视频下载",
                 thumbnail=DEMO_THUMBNAILS[2],
-                status="processing",
+                status="success",
                 size_mb=256.8,
                 created_at="2024-05-14 21:45:33",
             ),
@@ -195,6 +202,13 @@ def update_task(task_id: str, **values: object) -> None:
         task = session.get(Task, task_id)
         if task is None:
             return
+        # If task was already marked canceled by user, do not allow subsequent
+        # background transitions to overwrite status with completed/failed/processing.
+        if task.status == "canceled":
+            blocked_keys = {"status", "stage", "error", "output_path"}
+            values = {k: v for k, v in values.items() if k not in blocked_keys}
+            if not values:
+                return
         for key, val in values.items():
             if key == "input":
                 task.input_json = json.dumps(val, ensure_ascii=False)
@@ -213,17 +227,29 @@ def fail_stale_running_tasks(reason: str) -> int:
     """Mark tasks stuck in queued/processing from a previous run as failed.
 
     The backend runs tasks in-process; after a restart nothing resumes them, so
-    leaving them queued/processing would hang the user's UI forever.
+    leaving them queued/processing would hang the user's UI forever. Also
+    synchronizes HistoryItem status so the history list doesn't remain 'processing'.
     """
     changed = 0
     with get_session() as session:
         statement = select(Task).where(Task.status.in_(["queued", "processing"]))
-        for task in session.exec(statement):
+        stale_tasks = list(session.exec(statement))
+        for task in stale_tasks:
             task.status = "failed"
             task.stage = "服务重启，任务中断"
             task.error = reason
             task.updated_at = utc_now()
             changed += 1
+
+            # Keep HistoryItem synchronized so history cards don't show infinite loading
+            hist_statement = select(HistoryItem).where(HistoryItem.task_id == task.id)
+            for item in session.exec(hist_statement):
+                item.status = "failed"
+
+        # Also fail any orphaned or unlinked processing items to prevent hanging UI
+        orphan_statement = select(HistoryItem).where(HistoryItem.status == "processing")
+        for item in session.exec(orphan_statement):
+            item.status = "failed"
     return changed
 
 

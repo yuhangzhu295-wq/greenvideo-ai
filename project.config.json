@@ -1,5 +1,9 @@
 {
+  "miniprogramRoot": "apps/miniapp/dist/",
+  "projectname": "GreenVideo AI",
+  "description": "智能视频提取与处理",
   "setting": {
+    "urlCheck": false,
     "es6": true,
     "postcss": true,
     "minified": true,

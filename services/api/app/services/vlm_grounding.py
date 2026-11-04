@@ -127,9 +127,10 @@ You are a precise video watermark and overlay spatio-temporal detection assistan
 Analyze these timestamped sequential frames from a short video clip.
 
 Tasks:
-1. Locate every platform watermark (e.g. Douyin/TikTok, Kuaishou, Xiaohongshu, Bilibili, Doubao, CapCut logos and author IDs), floating animation watermarks, outro cards, and promotional QR codes.
+1. Locate every platform watermark (e.g. Douyin/TikTok, Kuaishou, Xiaohongshu, Bilibili,
+   Doubao, CapCut logos and author IDs), floating watermarks, outro cards, and promo QR codes.
 2. Distinguish removable external overlays from native video content:
-   - should_remove = true: Platform logos, creator ID watermarks, promotional QR codes, platform ending promo cards.
+   - should_remove = true: Platform logos, creator ID watermarks, promo cards.
    - should_remove = false: Native actor dialogue subtitles, in-scene shop signs, clothing text.
 3. For each watermark track, specify:
    - track_id: unique string (e.g., "track_logo_tl", "track_id_br")
@@ -139,7 +140,7 @@ Tasks:
    - start_s: first appearance timestamp (seconds)
    - end_s: last disappearance timestamp (seconds)
    - keyframes: list of bounding boxes [ymin, xmin, ymax, xmax] normalized to 0-1000 scale.
-4. If there is a static/uniform promotional outro card at the end of the video, set outro_start_s to its starting second, else null.
+4. If there is a promotional outro card at the end of the video, set outro_start_s, else null.
 
 Output STRICT JSON conforming to this schema:
 {
@@ -274,11 +275,15 @@ def call_openai_compatible_grounding(
 
     try:
         headers = {"Authorization": f"Bearer {api_key}"}
-        with httpx.Client(timeout=timeout_s) as client:
+        with httpx.Client(timeout=httpx.Timeout(timeout_s, connect=4.0)) as client:
             resp = client.post(url, json=payload, headers=headers)
             if resp.status_code != 200:
-                logger.warning("OpenAI VLM API error %d: %s", resp.status_code, resp.text[:200])
-                return VLMVideoAnalysisResult(ok=False, reason=f"OPENAI_API_ERROR_{resp.status_code}")
+                logger.warning(
+                    "OpenAI VLM API error %d: %s", resp.status_code, resp.text[:200]
+                )
+                return VLMVideoAnalysisResult(
+                    ok=False, reason=f"OPENAI_API_ERROR_{resp.status_code}"
+                )
 
             data = resp.json()
             text_content = data.get("choices", [{}])[0].get("message", {}).get("content", "")

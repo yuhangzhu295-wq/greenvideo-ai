@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { Button, Input, Text, View, Video } from "@tarojs/components";
+import { Button, Image, Input, Text, View, Video } from "@tarojs/components";
 import Taro from "@tarojs/taro";
 import { parseVideo, uploadWatermarkFile } from "@/api/client";
 import type { WatermarkPayload } from "@/api/types";
@@ -209,13 +209,21 @@ export default function WatermarkPage() {
 
         {filePath ? (
           <View className='watermark-video-wrapper'>
-            <Video
-              src={filePath}
-              className='watermark-video-player'
-              controls
-              autoplay={false}
-              showCenterPlayBtn
-            />
+            {/\.(jpe?g|png|webp)($|\?)/i.test(filePath) || fileLabel.startsWith("image") ? (
+              <Image
+                src={filePath}
+                className='watermark-video-player'
+                mode='aspectFit'
+              />
+            ) : (
+              <Video
+                src={filePath}
+                className='watermark-video-player'
+                controls
+                autoplay={false}
+                showCenterPlayBtn
+              />
+            )}
             <View className='watermark-track-tag'>AI 逐帧追踪就绪</View>
           </View>
         ) : (

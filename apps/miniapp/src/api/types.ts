@@ -50,6 +50,7 @@ export interface TaskStatus {
   stage: string;
   eta_seconds: number;
   download_url: string | null;
+  media_type?: "video" | "image" | "audio" | null;
   tracking_preview_url?: string | null;
   source_video_url?: string | null;
   frame_tracks?: Array<{

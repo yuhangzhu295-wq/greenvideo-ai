@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Button, Text, View, Video } from "@tarojs/components";
+import { Button, Image, Text, View, Video } from "@tarojs/components";
 import Taro from "@tarojs/taro";
 import { cancelTask, getTask, toAbsoluteUrl } from "@/api/client";
 import type { TaskStatus } from "@/api/types";
@@ -15,8 +15,8 @@ const initialTask: TaskStatus = {
   download_url: null
 };
 
-function isDone(task: TaskStatus) {
-  return task.status === "completed" || task.status === "success" || task.progress >= 100;
+function isDone(task: TaskStatus): boolean {
+  return task.status === "completed" || task.status === "success";
 }
 
 async function ensureAlbumPermission(): Promise<boolean> {
@@ -204,14 +204,35 @@ export default function ProcessingPage() {
           </View>
         ) : tab === "result" && isDone(task) && task.download_url ? (
           <View className='tracking-video-container'>
-            <Video
-              src={toAbsoluteUrl(task.download_url)}
-              className='tracking-video-player'
-              autoplay
-              controls
-            />
+            {task.media_type === "image" ? (
+              <Image
+                src={toAbsoluteUrl(task.download_url)}
+                className='tracking-video-player'
+                mode='aspectFit'
+              />
+            ) : task.media_type === "audio" ? (
+              <View className='audio-card-preview' style={{ padding: "40px 20px", textAlign: "center" }}>
+                <Text style={{ fontSize: "36px", display: "block", marginBottom: "8px" }}>🎵</Text>
+                <Text style={{ fontSize: "15px", color: "#333" }}>音频提取已就绪</Text>
+              </View>
+            ) : task.media_type === "video" ? (
+              <Video
+                src={toAbsoluteUrl(task.download_url)}
+                className='tracking-video-player'
+                autoplay
+                controls
+              />
+            ) : (
+              <View style={{ padding: "40px 20px", textAlign: "center", color: "#666" }}>
+                产物已生成，请直接点击下方保存或下载
+              </View>
+            )}
             <View className='tracking-tag-overlay done'>
-              ✓ AI 无损修复完成 · 纯净无损
+              {task.type === "download"
+                ? "✓ 文件下载完成"
+                : task.media_type === "audio"
+                ? "✓ 音频提取完成"
+                : "✓ AI 无损修复完成 · 纯净无损"}
             </View>
           </View>
         ) : (

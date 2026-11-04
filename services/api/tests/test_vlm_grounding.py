@@ -1,12 +1,10 @@
-import pytest
-from pathlib import Path
 from app.services.vlm_grounding import (
     VLMKeyframeBox,
-    VLMWatermarkTrack,
     VLMVideoAnalysisResult,
-    is_vlm_available,
-    convert_vlm_tracks_to_pixel_boxes,
+    VLMWatermarkTrack,
     analyze_video_watermarks_vlm,
+    convert_vlm_tracks_to_pixel_boxes,
+    is_vlm_available,
 )
 
 
@@ -83,6 +81,7 @@ def test_vlm_fallback_when_unconfigured(monkeypatch, tmp_path):
 def test_detect_timed_watermarks_hybrid_with_vlm(monkeypatch, tmp_path):
     import cv2
     import numpy as np
+
     from app.services.watermark_detect import detect_timed_watermarks_hybrid
 
     # Create dummy video

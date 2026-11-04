@@ -1,9 +1,22 @@
+from pathlib import Path
+
+import cv2
+import numpy as np
 from fastapi.testclient import TestClient
+
 from app.db import insert_task
 from app.main import app
 from app.services.storage import storage_path
 
 client = TestClient(app)
+
+
+def make_test_video(path: Path, frames: int = 4, size: tuple[int, int] = (160, 96)) -> None:
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(str(path), fourcc, 25.0, size)
+    for _ in range(frames):
+        out.write(np.zeros((size[1], size[0], 3), dtype=np.uint8))
+    out.release()
 
 
 def test_get_tracking_preview_file_not_ready():
@@ -25,7 +38,7 @@ def test_get_tracking_preview_file_not_ready():
 
 def test_get_tracking_preview_file_success(tmp_path):
     preview_file = storage_path("files", "tracking_task_preview_test_2.mp4")
-    preview_file.write_bytes(b"\x00\x00\x00\x1cftypisom\x00\x00\x02\x00isomiso2mp41")
+    make_test_video(preview_file, frames=4)
 
     insert_task(
         {
@@ -65,3 +78,26 @@ def test_get_tracking_preview_unsafe_path():
     resp = client.get("/api/files/test..id/tracking")
     assert resp.status_code == 400
     assert resp.json()["detail"]["code"] == "UNSAFE_PATH"
+
+
+def test_get_tracking_preview_corrupted():
+    preview_file = storage_path("files", "tracking_task_preview_corrupt.mp4")
+    preview_file.write_bytes(b"corrupted raw non-video bytes")
+
+    insert_task(
+        {
+            "id": "task_preview_corrupt",
+            "type": "watermark",
+            "status": "processing",
+            "progress": 30,
+            "stage": "正在智能修复",
+            "input": {},
+        }
+    )
+
+    resp = client.get("/api/files/task_preview_corrupt/tracking")
+    assert resp.status_code == 409
+    data = resp.json()
+    assert data["detail"]["code"] == "OUTPUT_NOT_PLAYABLE"
+
+    preview_file.unlink(missing_ok=True)

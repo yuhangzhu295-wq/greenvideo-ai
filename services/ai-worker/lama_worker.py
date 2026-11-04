@@ -49,10 +49,12 @@ def main() -> int:
             if img is None or mask is None:
                 print(json.dumps({"error": "decode failed"}), flush=True)
                 continue
+            # LaMa expects RGB input [H, W, C] and returns BGR output via cvtColor.
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             # Inference-only: without this guard torch builds an autograd graph,
             # which doubles memory and slows every forward pass severalfold.
             with torch.inference_mode():
-                result = model(img, mask, config)
+                result = model(img_rgb, mask, config)
             ok, buf = cv2.imencode(".png", result)
             if not ok:
                 print(json.dumps({"error": "encode failed"}), flush=True)

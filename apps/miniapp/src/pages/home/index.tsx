@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { Button, Text, View, Video } from "@tarojs/components";
+import { Button, Image, Text, View, Video } from "@tarojs/components";
 import Taro from "@tarojs/taro";
 import { uploadWatermarkFile } from "@/api/client";
 import type { WatermarkPayload } from "@/api/types";
@@ -10,6 +10,7 @@ type RepairMode = NonNullable<WatermarkPayload["repair_mode"]>;
 export default function HomePage() {
   const [filePath, setFilePath] = useState("");
   const [fileLabel, setFileLabel] = useState("");
+  const [fileType, setFileType] = useState<"image" | "video">("video");
   const [repairMode, setRepairMode] = useState<RepairMode>("ai");
   const [confirmed, setConfirmed] = useState(true);
   const [submitting, setSubmitting] = useState(false);
@@ -27,8 +28,10 @@ export default function HomePage() {
         fileType?: string;
       };
       setFilePath(file.tempFilePath);
+      const isImg = file.fileType === "image" || /\.(jpe?g|png|webp)($|\?)/i.test(file.tempFilePath);
+      setFileType(isImg ? "image" : "video");
       const sizeMb = file.size ? `${(file.size / 1024 / 1024).toFixed(2)} MB` : "已选择";
-      setFileLabel(`${file.fileType || "视频素材"} · ${sizeMb}`);
+      setFileLabel(`${isImg ? "图片素材" : "视频素材"} · ${sizeMb}`);
     } catch (err) {
       const msg = String((err as { errMsg?: string }).errMsg || "");
       if (!msg.includes("cancel")) {
@@ -39,7 +42,7 @@ export default function HomePage() {
 
   async function submit() {
     if (!filePath) {
-      Taro.showToast({ title: "请先选择需要去水印的视频", icon: "none" });
+      Taro.showToast({ title: "请先选择需要去水印的视频或图片", icon: "none" });
       return;
     }
     if (!confirmed) {
@@ -49,10 +52,11 @@ export default function HomePage() {
     setSubmitting(true);
     try {
       Taro.showLoading({ title: "上传处理中..." });
+      const isImg = fileType === "image";
       const task = await uploadWatermarkFile(filePath, {
-        mask_preset: "custom",
+        mask_preset: isImg ? "douyin_both_corners" : "custom",
         repair_mode: repairMode,
-        auto_detect: true,
+        auto_detect: !isImg,
         confirm_authorized: confirmed,
         timed_mask_regions: []
       });
@@ -78,28 +82,36 @@ export default function HomePage() {
       <Card className='watermark-card'>
         <View className='card-head'>
           <View>
-            <View className='page-title'>视频去水印</View>
-            <View className='muted'>全自动定位水印与片尾 · 逐帧动态平滑消除</View>
+            <View className='page-title'>去水印</View>
+            <View className='muted'>全自动定位水印与片尾 · 深度平滑消除</View>
           </View>
           <View className='safe-pill'>AI 自动感知</View>
         </View>
 
         {filePath ? (
           <View className='watermark-video-wrapper'>
-            <Video
-              src={filePath}
-              className='watermark-video-player'
-              controls
-              autoplay={false}
-              showCenterPlayBtn
-            />
+            {fileType === "image" ? (
+              <Image
+                src={filePath}
+                className='watermark-video-player'
+                mode='aspectFit'
+              />
+            ) : (
+              <Video
+                src={filePath}
+                className='watermark-video-player'
+                controls
+                autoplay={false}
+                showCenterPlayBtn
+              />
+            )}
             <View className='watermark-track-tag'>已选素材：{fileLabel}</View>
           </View>
         ) : (
           <View className='upload-zone' onClick={chooseFile} style={{ margin: "16px 0", cursor: "pointer" }}>
             <IconBadge icon='☁' tone='green' />
             <View>
-              <View className='upload-title'>点击上传待去水印视频</View>
+              <View className='upload-title'>点击上传待去水印视频或图片</View>
               <View className='muted'>支持 MP4 / MOV / AVI / JPG / PNG，自动识别消除</View>
             </View>
           </View>
@@ -108,7 +120,7 @@ export default function HomePage() {
         {filePath && (
           <View style={{ display: "flex", justifyContent: "flex-end", marginBottom: "12px" }}>
             <Button className='secondary-btn' style={{ fontSize: "12px", height: "30px", lineHeight: "28px" }} onClick={chooseFile}>
-              更换视频素材
+              更换素材
             </Button>
           </View>
         )}

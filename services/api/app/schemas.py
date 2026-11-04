@@ -113,6 +113,7 @@ class TaskStatusDTO(BaseModel):
     stage: str
     eta_seconds: int
     download_url: str | None = None
+    media_type: Literal["video", "image", "audio"] | None = None
     tracking_preview_url: str | None = None
     source_video_url: str | None = None
     frame_tracks: list[dict] | None = None

@@ -379,6 +379,8 @@ def test_p0_5_fragmented_output_without_nb_frames_is_rejected(tmp_path: Path, mo
 
 def test_p0_6_header_only_mp4_is_not_served(tmp_path: Path, monkeypatch) -> None:
     """An MP4 with a video stream header but zero frames is not playable."""
+    from fastapi import HTTPException
+
     import app.routers.files as files_router
 
     class FakeTask(dict):
@@ -412,12 +414,108 @@ def test_p0_6_header_only_mp4_is_not_served(tmp_path: Path, monkeypatch) -> None
     )
     monkeypatch.setattr(files_router, "get_task", lambda _id: task)
 
-    from fastapi import HTTPException
-
     with pytest.raises(HTTPException) as exc:
         files_router.get_file("task_header")
     assert exc.value.status_code == 409
     assert exc.value.detail["code"] in {"OUTPUT_EMPTY", "OUTPUT_NOT_PLAYABLE"}
+
+
+def test_p0_8_incomplete_task_cannot_be_downloaded(tmp_path: Path, monkeypatch) -> None:
+    """An uncompleted task (e.g. processing) must refuse file download."""
+    from fastapi import HTTPException
+
+    import app.routers.files as files_router
+
+    valid_file = tmp_path / "valid.png"
+    valid_file.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR...")
+
+    class FakeTask(dict):
+        @property
+        def status(self) -> str:
+            return self["status"]
+
+        @property
+        def output_path(self):
+            return self["output_path"]
+
+        @property
+        def type(self) -> str:
+            return self["type"]
+
+    task = FakeTask(
+        {
+            "id": "task_in_progress",
+            "type": "watermark",
+            "status": "processing",
+            "output_path": str(valid_file),
+        }
+    )
+    monkeypatch.setattr(files_router, "get_task", lambda _id: task)
+
+    with pytest.raises(HTTPException) as exc:
+        files_router.get_file("task_in_progress")
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "TASK_NOT_SUCCESSFUL"
+
+
+def test_p0_9_unplayable_output_no_download_url(tmp_path: Path, monkeypatch) -> None:
+    """A completed task whose output is corrupted must not advertise download_url in status."""
+    from app.routers.tasks import get_task_status
+
+    corrupt_mp4 = tmp_path / "corrupt.mp4"
+    corrupt_mp4.write_bytes(b"corrupted bytes non playable")
+
+    class FakeTask(dict):
+        @property
+        def id(self) -> str:
+            return self["id"]
+
+        @property
+        def status(self) -> str:
+            return self["status"]
+
+        @property
+        def output_path(self):
+            return self["output_path"]
+
+        @property
+        def type(self) -> str:
+            return self["type"]
+
+        @property
+        def progress(self) -> int:
+            return self["progress"]
+
+        @property
+        def stage(self) -> str:
+            return self["stage"]
+
+        @property
+        def error(self):
+            return None
+
+        @property
+        def input_json(self):
+            return "{}"
+
+    task = FakeTask(
+        {
+            "id": "task_corrupt_test",
+            "type": "watermark",
+            "status": "completed",
+            "progress": 100,
+            "stage": "处理完成",
+            "output_path": str(corrupt_mp4),
+        }
+    )
+    import app.routers.tasks as tasks_router
+    monkeypatch.setattr(tasks_router, "get_task", lambda _id: task)
+
+    status_dto = get_task_status("task_corrupt_test")
+    assert status_dto.status == "failed", "Corrupted output must transition status to failed"
+    assert status_dto.stage == "产物损坏无法播放"
+    assert status_dto.download_url is None, "Corrupted video must not have download_url"
+    assert status_dto.media_type is None
 
 
 def test_p0_7_truncated_source_video_is_rejected_before_repair(tmp_path: Path) -> None:

@@ -16,7 +16,7 @@ export default defineConfig(async () => {
       828: 0.905
     },
     sourceRoot: "src",
-    outputRoot: "dist",
+    outputRoot: process.env.TARO_ENV === "h5" ? "dist_h5" : "dist",
     alias: {
       "@": path.resolve(__dirname, "..", "src")
     },

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shutil
 from pathlib import Path
 from typing import Any
@@ -467,6 +468,12 @@ async def _run_watermark_task_locked(
     source_path: Path | None,
     processor: WatermarkProcessor,
 ) -> None:
+    # A task that was canceled while queued behind HEAVY_TASK_GATE must exit
+    # immediately instead of spending compute on canceled work.
+    current_task = get_task(task_id)
+    if current_task is not None and current_task.status == "canceled":
+        return
+
     try:
         _safe_stage(task_id, 8, "准备素材")
         await asyncio.sleep(0.05)
@@ -586,9 +593,15 @@ async def _run_watermark_task_locked(
                         preview_dest,
                         target_max_frames,
                     )
+                    current = get_task(task_id)
+                    if current is not None and current.status == "canceled":
+                        preview_dest.unlink(missing_ok=True)
+                        return
                     tracking_ready = preview_dest.exists() and preview_dest.stat().st_size > 0
                 except Exception as exc:
-                    logging.getLogger(__name__).warning("Failed to render tracking preview: %s", exc)
+                    logging.getLogger(__name__).warning(
+                        "Failed to render tracking preview: %s", exc
+                    )
 
                 sample_s = max(1, len(detection.frame_tracks) // 60)
                 for rec in detection.frame_tracks[::sample_s]:
@@ -701,7 +714,9 @@ async def _run_watermark_task_locked(
                 is_canceled,
                 effective_timed_regions,
                 target_max_frames,
-                getattr(detection, "frame_tracks", None) if "detection" in locals() and detection else None,
+                getattr(detection, "frame_tracks", None)
+                if "detection" in locals() and detection
+                else None,
             )
             engine = processor.last_engine
             engine_note = processor.last_engine_note
@@ -746,27 +761,45 @@ async def _run_watermark_task_locked(
                 _probe_fps(source_path),
                 target_max_frames,
             )
-            if not verify.get("ok") and verify.get("residual_ratio", 1.0) > 0.05:
-                update_task(
-                    task_id,
-                    status="failed",
-                    progress=100,
-                    stage="水印残留校验未通过",
-                    error=(
-                        f"修复后仍有 {verify['residual_count']}/{verify['total']} 个抽检点检出水印残留"
-                        f"（比例 {verify['residual_ratio']:.0%}），任务已标记失败而非交付残留成片。"
-                        f"残留样例：{verify['residual'][:5]}"
-                    ),
-                    output_path=str(output),
-                )
-                update_history_by_task(task_id, status="failed")
-                return
             if not verify.get("ok"):
+                if verify.get("total", 0) == 0:
+                    update_task(
+                        task_id,
+                        status="failed",
+                        progress=100,
+                        stage="水印残留校验未通过",
+                        error="未能对修复后视频执行有效的局部残差抽检，已中止而非交付未验证视频。",
+                        output_path=str(output),
+                    )
+                    update_history_by_task(task_id, status="failed")
+                    return
+                if verify.get("residual_ratio", 1.0) > 0.05:
+                    update_task(
+                        task_id,
+                        status="failed",
+                        progress=100,
+                        stage="水印残留校验未通过",
+                        error=(
+                            f"修复后仍有 {verify['residual_count']}/{verify['total']} "
+                            f"个抽检点检出水印残留（比例 {verify['residual_ratio']:.0%}），"
+                            "任务已标记失败而非交付残留成片。"
+                            f"残留样例：{verify['residual'][:5]}"
+                        ),
+                        output_path=str(output),
+                    )
+                    update_history_by_task(task_id, status="failed")
+                    return
                 _safe_stage(
                     task_id,
                     95,
-                    f"残留校验：{verify['residual_count']}/{verify['total']} 个抽检点轻微残留（≤5%），已交付",
+                    f"残留校验：{verify['residual_count']}/{verify['total']} "
+                    "个抽检点轻微残留（≤5%），已交付",
                 )
+
+        current = get_task(task_id)
+        if current is not None and current.status == "canceled":
+            _discard_output(output)
+            return
 
         update_task(
             task_id,
@@ -847,12 +880,54 @@ def get_task_status(task_id: str) -> TaskStatusDTO:
 
     progress = int(task.progress)
     status = task.status
-    if progress >= 100 and status not in {"failed", "canceled"}:
-        status = "completed"
+    stage = task.stage
 
     download_url = None
+    media_type = None
     if status in {"completed", "success"}:
-        download_url = f"/api/files/{task_id}"
+        if task.output_path:
+            out_p = Path(task.output_path)
+            if out_p.exists() and out_p.stat().st_size > 0:
+                ext = out_p.suffix.lower()
+                is_img = ext in {".jpg", ".jpeg", ".png", ".webp"}
+                is_aud = ext in {".mp3", ".m4a", ".aac", ".wav", ".ogg"}
+                is_vid = ext in {".mp4", ".mov", ".avi"}
+
+                playable = True
+                if is_img:
+                    import cv2
+
+                    img = cv2.imread(str(out_p))
+                    if img is None or img.size == 0:
+                        playable = False
+                elif is_aud or is_vid:
+                    from app.services.video_repair import media_integrity_issues
+
+                    try:
+                        if media_integrity_issues(out_p, "audio" if is_aud else "video"):
+                            playable = False
+                    except Exception:
+                        playable = False
+                else:
+                    playable = False
+
+                if playable:
+                    download_url = f"/api/files/{task_id}"
+                    if is_img:
+                        media_type = "image"
+                    elif is_aud:
+                        media_type = "audio"
+                    elif is_vid:
+                        media_type = "video"
+                else:
+                    status = "failed"
+                    stage = "产物损坏无法播放"
+            else:
+                status = "failed"
+                stage = "输出文件不存在或为空"
+        else:
+            status = "failed"
+            stage = "任务未生成输出文件"
 
     task_input = {}
     if getattr(task, "input_json", None):
@@ -862,7 +937,7 @@ def get_task_status(task_id: str) -> TaskStatusDTO:
             task_input = {}
 
     tracking_preview_url = None
-    if task_input.get("tracking_preview_ready"):
+    if task_input.get("tracking_preview_ready") and status not in {"failed", "canceled"}:
         tracking_preview_url = f"/api/files/{task_id}/tracking"
 
     source_video_url = None
@@ -878,9 +953,10 @@ def get_task_status(task_id: str) -> TaskStatusDTO:
         type=task.type,
         status=status,
         progress=progress,
-        stage=task.stage,
+        stage=stage,
         eta_seconds=_eta(progress),
         download_url=download_url,
+        media_type=media_type,
         tracking_preview_url=tracking_preview_url,
         source_video_url=source_video_url,
         frame_tracks=frame_tracks,
@@ -899,8 +975,12 @@ def cancel_task(task_id: str) -> dict:
             detail={"code": "NOT_FOUND", "message": "任务不存在。"},
         )
     if task.status not in {"completed", "success", "failed"}:
-        update_task(task_id, status="canceled", error="用户已取消", stage="已取消")
+        update_task(
+            task_id, status="canceled", error="用户已取消", stage="已取消", output_path=None
+        )
         update_history_by_task(task_id, status="failed")
+        preview_path = storage_path("files", f"tracking_{task_id}.mp4")
+        preview_path.unlink(missing_ok=True)
     return {"ok": True}
 
 

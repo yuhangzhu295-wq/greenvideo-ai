@@ -1,0 +1,23 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [
+    ".git",
+    ".agents",
+    "apps",
+    "storage",
+    "work",
+    "node_modules",
+    ".venv",
+    "*/.venv",
+    "scripts",
+    "artifacts",
+    "recovery",
+    "services/ai-worker",
+    "test_parse.py",
+    "test_parse2.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008"]

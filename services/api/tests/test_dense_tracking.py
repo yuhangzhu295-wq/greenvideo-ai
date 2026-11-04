@@ -8,16 +8,11 @@ import math
 
 import cv2
 import numpy as np
-import pytest
 
 from app.services.watermark import FrameTrajectoryMaskProvider
 from app.services.watermark_detect import (
-    Detection,
-    FrameTrackRecord,
-    TrackedBox,
     _fuzzy_text_hit,
     _sightings_to_moving_detections,
-    track_watermarks_dense,
 )
 
 
@@ -31,6 +26,9 @@ def test_fuzzy_text_hit_misreads():
     # OCR misreads on semi-transparent overlays: <=2 edit distance passes.
     assert _fuzzy_text_hit("bilibli", {"bilibili"})
     assert _fuzzy_text_hit("bilibil", {"bilibili"})
+    # Multi-target search: failing on the first target must not abort checking subsequent targets.
+    assert _fuzzy_text_hit("bilibli", {"unrelated_target", "bilibili"}) is True
+    assert _fuzzy_text_hit("bilibli", {"bilibili", "unrelated_target"}) is True
     # Unrelated scene text must not match.
     assert not _fuzzy_text_hit("hello world", {"bilibili"})
     assert not _fuzzy_text_hit("", {"bilibili"})
@@ -157,7 +155,6 @@ def test_end_to_end_trajectory_coverage_against_ground_truth(tmp_path):
     assert det.ok, f"detection failed: {det.reason}"
     assert det.frame_tracks, "no frame tracks produced"
 
-    from app.services.watermark import FrameTrajectoryMaskProvider
 
     provider = FrameTrajectoryMaskProvider(det.frame_tracks, h, w)
     covered = 0
@@ -178,4 +175,6 @@ def test_end_to_end_trajectory_coverage_against_ground_truth(tmp_path):
         else:
             misses.append((i, round(inter / gt_area, 2)))
     ratio = covered / max(1, total)
-    assert ratio >= 0.95, f"trajectory covers only {ratio:.1%} of ground-truth frames; worst: {misses[:10]}"
+    assert ratio >= 0.95, (
+        f"trajectory covers only {ratio:.1%} of ground-truth frames; worst: {misses[:10]}"
+    )

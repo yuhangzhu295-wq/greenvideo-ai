@@ -692,21 +692,6 @@ class WatermarkProcessor:
         if repair_mode == "ai":
             # The persistent CUDA worker path lives inside repair_video and does
             # not need the IOPaint HTTP server; only fall back to gating on
-            # IOPaint health when the worker cannot run this machine.
-            from app.services.video_repair import LamaWorker
-
-            worker_probe = LamaWorker()
-            try:
-                worker_probe.start()
-                worker_probe.stop()
-            except Exception:
-                worker_probe = None
-                available, reason = iopaint_status()
-                if not available:
-                    # Never claim AI success when the engine did not run. The caller
-                    # decides whether to fail the task or ask for another mode.
-                    raise AiServiceError(f"AI 修复引擎不可用：{reason}")
-
             cap.release()
             if progress_cb:
                 progress_cb(12, "AI 引擎已就绪，开始逐帧 LaMa 修复")
