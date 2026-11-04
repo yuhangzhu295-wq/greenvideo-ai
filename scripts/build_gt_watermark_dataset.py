@@ -127,6 +127,10 @@ def generate_video(
     for i in range(n):
         t = i / fps
         bg = _make_background(scene, h, w, t)
+        # Save clean frame (no watermark) for E2E repair quality comparison
+        clean_dir = video_dir / "clean_frames"
+        clean_dir.mkdir(exist_ok=True)
+        cv2.imwrite(str(clean_dir / f"{i:06d}.png"), bg)
         wm_mask = np.zeros((h, w), dtype=np.uint8)
         pos = _watermark_position(traj, t, dur_s, h, w, rng)
 

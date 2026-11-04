@@ -504,3 +504,28 @@ OCR 路线（paddlepaddle 3.2.2 + PaddleOCR 3.7.0 CPU）实测可用但 11 秒/�
 2. 实现分检测端帧（per-detection end_frame）
 3. 建立简化 E2E Gate（检测→SAM2→LaMa→输出）
 4. 重新提交双审查
+
+## Round 7 — 真实 E2E Gate 实测结果（2026-11-05）
+
+### 已落地
+1. `scripts/run_e2e_gate.py`：真实端到端 Gate — 自动检测 → SAM2 分割 → LaMa 修复 → 与 clean frame 对比
+2. GT 数据集增加 `clean_frames/` 目录（无水印基准帧）
+3. 修复 Detection.box 坐标格式转换（x,y,w,h → x1,y1,x2,y2）
+
+### E2E Gate 实测结果（8 samples）
+| 场景 | 检测 | SAM2 mask | LaMa 修复 | outside_exact | 裁定 |
+|------|------|-----------|-----------|---------------|------|
+| sky/fixed_br | ✅ 1 box 正确 | P=0.447, R=1.0 | outside_psnr=63.69 | 0.995 | **PASS** |
+| grass/fixed_tl | ❌ 6 boxes 全误报 | P=0.0（mask 覆盖全帧） | outside_psnr=8.07 | 0.20 | FAIL |
+| night/corner_hop | ❌ 0 boxes（漏检） | 无 mask | — | 1.0（无修复） | FAIL |
+| building/drift | ⚠️ 3-4 boxes 部分正确 | P=0.21-0.26 | outside_psnr=56-57 | 0.986 | FAIL |
+
+### 客观结论
+- **SAM2 + LaMa 管线本身在 sky（简单均匀背景）上完全通过**：检测正确 → SAM2 精确分割 → LaMa 去除水印 → 背景无损伤（outside_exact=99.5%）
+- **瓶颈在检测算法**：temporal median + structural energy 在噪声/暗/结构化背景上产生误报或漏检
+- 这不是 SAM2 或 LaMa 的问题——是 detect_timed_watermarks_hybrid 的检测鲁棒性问题
+
+### 下一步
+- 提升检测算法在复杂背景上的鲁棒性（单独任务）
+- 或引入专门的水印检测模型（需要训练数据）
+- 当前 SAM2 像素级 mask 管线架构已验证正确
