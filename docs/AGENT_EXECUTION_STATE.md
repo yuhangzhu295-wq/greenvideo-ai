@@ -302,3 +302,80 @@ OCR 路线（paddlepaddle 3.2.2 + PaddleOCR 3.7.0 CPU）实测可用但 11 秒/�
 ### 待办
 
 审查代理恢复后需完成第 11 轮独立复核，重点见 `docs/REVIEW_STATUS.md`。
+
+---
+
+# P0 像素级水印识别重构 — 执行状态（2026-11-04 起）
+
+## Round 1 — P0 根因复现与审计（2026-11-04）
+
+### 当前 Git commit
+- `6fb7722`（master 与 recovery/development 已同步 GitHub）
+
+### P0 缺陷（代码审计逐行确认）
+**矩形 Mask 导致正常画面被 LaMa 重建**：
+- `services/api/app/services/watermark.py:213` — `FrameTrajectoryMaskProvider.mask_for()` 将 tracking box 整块 `mask[y1:y2, x1:x2] = 255`
+- `watermark.py:180` — `TimedMaskProvider.mask_for()` 同样整块矩形写 255
+- `watermark.py:322` — `MovingMaskTracker.mask_for()` Sobel/contrast percentile 找 box 后仍整矩形填 255
+- `watermark.py:475` — 另一处相同模式
+
+**根因**：tracking box 是检测 prompt，却被直接当作修复 mask。LaMa 因此重建大量正常背景纹理。这不是像素级 watermark segmentation。
+
+### 实施方案
+1. 旧逻辑全部保留为 fallback，不删除。
+2. 新建 `services/api/app/services/watermark_detection/` 模块层：
+   - `text_detector.py` — PaddleOCR 只输出 polygon/text/confidence
+   - `mask_segmenter.py` — SAM 2.1 prompt-based pixel mask
+   - `video_tracker.py` — SAM2VideoPredictor 跨帧传播（jump 即切段）
+   - `track_manager.py` — 多 track 生命周期
+   - `pixel_mask_provider.py` — `PixelMaskProvider.mask_for()` 兼容现有契约
+3. SAM 2.1 集成到独立 `services/ai-worker/`（sam2_worker.py，模型常驻 GPU）
+4. Mask debug artifacts：`artifacts/watermark-mask/<task>/`
+5. 新 Gate：Mask P/R/IoU/FP/FN + 分区 PSNR/SSIM + temporal flicker
+
+### 下一步
+- Round 2：安装 sam2 到 ai-worker venv，写模块骨架
+
+## Round 2 — SAM 2.1 集成与模块层实现（2026-11-05）
+
+### Git commit
+- 待提交（Round 2 新增代码未 push）
+
+### 已落地代码
+1. **`services/ai-worker/sam2_worker.py`**（新建，lint 通过）：
+   - SAM 2.1 常驻 GPU worker，stdin/stdout 协议
+   - `segment_image`：box/points prompt → pixel mask + score + IoU + area
+   - `propagate_video`：SAM2VideoPredictor 跨帧 mask 传播
+   - 模型：sam2.1_hiera_large.pt（898MB，Apache 2.0），已下载到 `services/ai-worker/checkpoints/`
+   - 实测验证：720x1280 帧 box prompt 得到精确像素 mask（coverage 50.1% 非矩形 100%）
+
+2. **`services/api/app/services/watermark_detection/`**（新建模块层，lint 通过）：
+   - `__init__.py` — 包描述
+   - `sam2_client.py` — SAM2 worker 客户端（与 LamaWorker 相同协议模式）
+   - `text_detector.py` — PaddleOCR prompt producer（仅输出 polygon/text/confidence）
+   - `track_manager.py` — 多 track 生命周期，jump 切段，gap 诚实上报
+   - `pixel_mask_provider.py` — `PixelMaskProvider.mask_for()` 兼容现有修复契约，极小 dilation (5x5, 2 iters)
+   - `mask_gate.py` — Mask P/R/IoU/FP/FN + 分区 PSNR/SSIM + normal_pixels_modified
+
+3. **`services/api/tests/test_pixel_mask_pipeline.py`**（新建，4 项全过）：
+   - TrackManager jump 切段验证（跳角→新 segment，不插值穿越中心）
+   - TrackManager gap 诚实上报（帧 0→10 gap=[(1,9)]，不伪造连续性）
+   - Mask Gate 矩形 blowout 拒绝（rectangle precision<0.5，normal_pixels_modified>5000）
+   - 画质 Gate 背景保护（pixel mask outside_change=0.0；rectangle blowout outside_psnr<50 且 changed>1000）
+
+4. **`docs/THIRD_PARTY_AI_LICENSE_AUDIT.md`**（新建）：
+   - SAM 2.1 / LaMa / PaddleOCR：Apache 2.0，生产可用
+   - ProPainter / E2FGVI：NonCommercial，仅 Benchmark
+   - STTN：代码 MIT 可用，NC 权重须自训或替代
+
+### 测试结果
+- 全量 Pytest：**74 passed, 1 deselected, 0 failed**（含新增 4 项 pixel mask 测试）
+- 全项目 `ruff check .`：All checks passed
+- SAM2 CUDA 实测：720x1280 box prompt → score 0.989, area 20045/40000 (50.1% 非矩形)
+- TrackManager: jump 切段 / gap 上报 / 无插值 — 全部通过
+
+### Reviewer 结论
+- 待双代理盲测后填写
+
+### 下一步
+- Round 3：接入 tasks.py 主链路（rectangle 仅作 prompt）；建立 STTN worker；GT 数据集；双代理盲测

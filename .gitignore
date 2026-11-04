@@ -40,3 +40,4 @@ artifacts/
 .env
 recovery/
 work/
+services/ai-worker/checkpoints/
