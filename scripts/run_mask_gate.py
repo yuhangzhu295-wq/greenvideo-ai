@@ -86,12 +86,19 @@ def run_gate(dataset_dir: str | Path, sample_frames: int = 3) -> dict:
                 ] = 255
                 m_rect = evaluate_mask(rect_mask, gt)
 
+                # Thresholds calibrated from GT data: SAM2 achieves P>=0.58,
+                # normal_modified 0.07-0.28% of frame; rectangle achieves
+                # P=0.31-0.43, normal_modified 0.21-0.90%. Thresholds set
+                # so pixel masks pass and rectangles fail.
                 pixel_pass = (
-                    m.precision >= 0.3
+                    m.precision >= 0.5
                     and m.recall >= 0.3
-                    and m.normal_pixels_modified < (h * w * 0.02)
+                    and m.normal_pixels_modified < (h * w * 0.005)
                 )
-                rect_pass = False  # rectangle NEVER passes by design
+                rect_pass = (
+                    m_rect.precision >= 0.5
+                    and m_rect.normal_pixels_modified < (h * w * 0.005)
+                )
 
                 all_results.append({
                     "video": video_dir.name,

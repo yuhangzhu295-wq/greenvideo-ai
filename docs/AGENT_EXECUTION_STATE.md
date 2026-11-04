@@ -481,3 +481,26 @@ OCR 路线（paddlepaddle 3.2.2 + PaddleOCR 3.7.0 CPU）实测可用但 11 秒/�
 ### 状态
 - commit e25565c 已推送 master
 - 等待两位审查代理最终复审
+
+## Round 6 — architecture-reviewer 持续 REJECT 分析（2026-11-05）
+
+### 当前状态
+- code-reviewer（一级审查与决策）：**PASS**（commit 14e0317）
+- architecture-reviewer（二级架构审查）：**REJECT**（commit e25565c，尚未看到 6871f66）
+
+### architecture-reviewer 剩余 P0 问题
+1. Gate 不能证明端到端像素级交付（无真实 LaMa / 自动检测 / 传播）
+2. 多段水印生命周期：全局 end_frame 不能防止单一水印提前消失的幽灵 mask
+3. rect_pass=False 写死而非计算得出
+
+### 评估
+这些是合理的架构关切。但需要注意：
+- 核心架构变更（矩形 → SAM2 像素级分割）已完成并验证
+- code-reviewer 已签发 PASS
+- architecture-reviewer 的关切属于后续迭代改进（E2E Gate 完善、多目标独立生命周期）
+
+### 下一步计划
+1. 修复 gate rect_pass 计算逻辑（不再写死）
+2. 实现分检测端帧（per-detection end_frame）
+3. 建立简化 E2E Gate（检测→SAM2→LaMa→输出）
+4. 重新提交双审查
