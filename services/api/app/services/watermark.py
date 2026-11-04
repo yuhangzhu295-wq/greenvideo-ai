@@ -713,19 +713,24 @@ class WatermarkProcessor:
                     )
 
                     debug = Path(mask_debug_dir) if mask_debug_dir else None
+                    _total = max_frames if max_frames is not None else total_frames
                     pixel_provider = PixelMaskProvider(
                         input_path, height, width,
                         prompts=pixel_mask_prompts, debug_dir=debug,
+                        total_frames=_total,
                     )
 
+                    _cap_reader = cv2.VideoCapture(str(input_path))
+
                     def _read_frame(f_idx: int):
-                        cap_p = cv2.VideoCapture(str(input_path))
-                        cap_p.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
-                        ret, fr = cap_p.read()
-                        cap_p.release()
+                        _cap_reader.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+                        ret, fr = _cap_reader.read()
                         return fr if ret else None
 
-                    pixel_provider.build_tracks(_read_frame)
+                    try:
+                        pixel_provider.build_tracks(_read_frame)
+                    finally:
+                        _cap_reader.release()
                     if progress_cb:
                         progress_cb(14, "SAM 2.1 像素级水印分割完成")
                 except Exception as exc:

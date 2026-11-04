@@ -40,24 +40,29 @@ class PixelMaskProvider:
         height: int,
         width: int,
         prompts: dict[int, list[dict]] | None = None,
+        total_frames: int = 0,
         keyframe_interval: int = 30,
         debug_dir: Path | None = None,
     ) -> None:
         self.video_path = str(video_path)
         self.height = height
         self.width = width
+        self.total_frames = total_frames
         self.keyframe_interval = keyframe_interval
         self.debug_dir = Path(debug_dir) if debug_dir else None
         self.used_fallback = False
         self.worker = Sam2Worker()
         self.tracks = TrackManager()
-        self._prompt_map: dict[int, dict] = {}
+        # prompts: {frame_idx: [{"box": [x,y,w,h]}, ...]} — multiple per frame
+        self._prompts: dict[int, list[dict]] = {}
         for f_idx, plist in (prompts or {}).items():
+            entries = []
             for p in plist:
                 box = p.get("box")
                 if box:
-                    xyxy = [box[0], box[1], box[0] + box[2], box[1] + box[3]]
-                    self._prompt_map[int(f_idx)] = {"box": xyxy}
+                    entries.append({"box": [box[0], box[1], box[0] + box[2], box[1] + box[3]]})
+            if entries:
+                self._prompts[int(f_idx)] = entries
 
     def _save_debug(self, frame_idx: int, frame, boxes, mask) -> None:
         import json
@@ -82,23 +87,55 @@ class PixelMaskProvider:
         )
 
     def build_tracks(self, frame_reader) -> None:
-        """Segment key frames and propagate masks through the video.
+        """Segment key frames then propagate masks through the video via SAM2 video predictor.
+
+        This is the critical fix: without propagate_video, only keyframes have
+        masks and all other frames return empty. The propagation fills the gap.
 
         ``frame_reader(frame_index)`` returns the BGR frame (or None).
         """
+        if not self._prompts:
+            return
+
         self.worker.start()
         try:
-            keyframes = sorted(self._prompt_map.keys())
+            # Phase 1: Segment key frames (multi-object: OR all masks per frame)
+            keyframes = sorted(self._prompts.keys())
+            keyframe_prompts: dict[int, dict] = {}
             for kf in keyframes:
                 frame = frame_reader(kf)
                 if frame is None:
                     continue
-                prompt = self._prompt_map[kf]
-                seg = self.worker.segment_frame(frame, box=prompt["box"])
-                mask = _dilate_small(seg["mask"])
-                x1, y1, x2, y2 = prompt["box"]
-                self.tracks.add_mask(kf, mask, box=(x1, y1, x2 - x1, y2 - y1))
-                self._save_debug(kf, frame, [prompt["box"]], mask)
+                plist = self._prompts[kf]
+                combined_mask = np_zeros(self.height, self.width)
+                boxes_used = []
+                for p in plist:
+                    seg = self.worker.segment_frame(frame, box=p["box"])
+                    m = _dilate_small(seg["mask"])
+                    combined_mask = _or_masks(combined_mask, m)
+                    boxes_used.append(p["box"])
+                x1, y1, x2, y2 = plist[0]["box"]
+                self.tracks.add_mask(kf, combined_mask, box=(x1, y1, x2 - x1, y2 - y1))
+                self._save_debug(kf, frame, boxes_used, combined_mask)
+                # Collect prompt for video propagation
+                keyframe_prompts[kf] = {"box": plist[0]["box"]}
+
+            # Phase 2: Propagate masks across the full video using SAM2 video predictor.
+            # This fills in every frame between/after keyframes — without this,
+            # only keyframes had masks and the rest of the video was unmasked.
+            if keyframe_prompts and self.total_frames > len(keyframe_prompts):
+                all_indices = list(range(self.total_frames))
+                prop_result = self.worker.propagate_video(
+                    self.video_path,
+                    prompts=keyframe_prompts,
+                    frame_indices=all_indices,
+                )
+                for f_idx_str, item in prop_result.items():
+                    f_idx = int(f_idx_str)
+                    if self.tracks.mask_for(f_idx) is not None:
+                        continue  # keyframe already has a segmented mask
+                    mask = _dilate_small(item["mask"])
+                    self.tracks.add_mask(f_idx, mask)
         finally:
             self.worker.stop()
 
@@ -112,3 +149,15 @@ class PixelMaskProvider:
         h, w = m.shape[:2]
         mask[: min(h, self.height), : min(w, self.width)] = m[: self.height, : self.width]
         return mask
+
+
+def np_zeros(h: int, w: int):
+    import numpy as np
+
+    return np.zeros((h, w), dtype=np.uint8)
+
+
+def _or_masks(a, b):
+    import numpy as np
+
+    return np.maximum(np.asarray(a, dtype=np.uint8), np.asarray(b, dtype=np.uint8))

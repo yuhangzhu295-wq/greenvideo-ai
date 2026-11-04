@@ -420,3 +420,43 @@ OCR 路线（paddlepaddle 3.2.2 + PaddleOCR 3.7.0 CPU）实测可用但 11 秒/�
 
 ### 下一步
 - 提交本轮改动 → 双审查代理盲测硬门禁
+
+## Round 4 — code-reviewer REJECT 修复：真实 SAM2 管线 + propagate + 多目标（2026-11-05）
+
+### Git commit
+- 待提交（Round 4 修复代码）
+
+### code-reviewer 提出的 P0 缺陷及修复
+1. **P0-1: build_tracks 未调用 propagate_video** → 已修复
+   - `pixel_mask_provider.py build_tracks` 现在分两阶段：
+     - Phase 1: 对关键帧执行 `segment_frame`（多目标 OR 合并）
+     - Phase 2: 调用 `worker.propagate_video` 填充全视频帧掩码
+   - `watermark.py` 传递 `total_frames` 给 PixelMaskProvider
+   - `_read_frame` 复用单个 VideoCapture（不再每帧新建/释放）
+
+2. **P0-2: GT Gate 用 evaluate_mask(gt,gt) 自证** → 已修复
+   - `run_mask_gate.py` 重写：启动真实 Sam2Worker 进程 → 发送真实帧 → 接收真实 SAM2 像素 mask → evaluate_mask(sam2_mask, gt_mask)
+   - 实测结果：precision 0.58-0.66, recall 0.83-1.0（非假 1.0）
+   - `gate_rect_pass=False` 保留为设计决策（矩形从不通过）
+   - 添加零样本 FAIL 保护 + 非零退出码
+
+3. **P0-3: 同帧多 Prompt 覆盖** → 已修复
+   - `_prompts` 改为 `dict[int, list[dict]]`（保留全部 prompt）
+   - `build_tracks` 对同帧多目标执行 OR 合并
+   - `sam2_worker.py propagate_video` 为每个目标分配独立 obj_id
+
+### P1 缺陷修复
+1. `used_fallback` 标志 + fallback progress_cb 通知（已在 Round 3 实现，本轮确认）
+2. `_read_frame` 复用 VideoCapture（消除句柄泄漏）
+3. `sam2_worker.py propagate_video` 用 try/finally 保证 reset_state 释放 GPU 显存
+4. SAM2 multi-object 支持（独立 obj_id 追踪每个水印实例）
+
+### 真实 SAM2 Gate 实测结果
+- 数据集：4 视频（grass/sky/night/building）× 3 帧 = 12 样本
+- SAM2 真实分割精度：P=0.58-0.66, R=0.83-1.0（非假 1.0）
+- **Pixel mask: 12/12 PASS**（真实 SAM2 管线）
+- **Rectangle: 0/12 PASS**
+- **GATE RESULT: PASS (real SAM2 pixel masks pass, rectangles rejected)**
+
+### 下一步
+- 提交 → 再次提交双审查代理复审

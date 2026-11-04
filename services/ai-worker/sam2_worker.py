@@ -104,35 +104,50 @@ def _run_propagate_video(video_model, req) -> dict:
     wanted = set(int(i) for i in frame_filter) if frame_filter is not None else None
 
     state = video_model.init_state(video_path)
-    for f_idx_raw, p in prompts.items():
-        f_idx = int(f_idx_raw)
-        if p.get("box"):
-            video_model.add_new_points_or_box(
-                state,
-                frame_idx=f_idx,
-                obj_id=0,
-                box=np.array(p["box"], dtype=np.float32),
-            )
-        elif p.get("points"):
-            labels = p.get("labels") or [1] * len(p["points"])
-            video_model.add_new_points_or_box(
-                state,
-                frame_idx=f_idx,
-                obj_id=0,
-                points=np.array(p["points"], dtype=np.float32),
-                labels=np.array(labels, dtype=np.int32),
-            )
+    try:
+        # Support multiple objects per frame (multi-watermark): each prompt
+        # entry gets its own obj_id so SAM2 tracks them independently.
+        obj_id = 0
+        for f_idx_raw, plist in prompts.items():
+            f_idx = int(f_idx_raw)
+            entries = plist if isinstance(plist, list) else [plist]
+            for p in entries:
+                if p.get("box"):
+                    video_model.add_new_points_or_box(
+                        state,
+                        frame_idx=f_idx,
+                        obj_id=obj_id,
+                        box=np.array(p["box"], dtype=np.float32),
+                    )
+                    obj_id += 1
+                elif p.get("points"):
+                    labels = p.get("labels") or [1] * len(p["points"])
+                    video_model.add_new_points_or_box(
+                        state,
+                        frame_idx=f_idx,
+                        obj_id=obj_id,
+                        points=np.array(p["points"], dtype=np.float32),
+                        labels=np.array(labels, dtype=np.int32),
+                    )
+                    obj_id += 1
 
-    results: dict[str, dict] = {}
-    for frame_idx, _obj_ids, mask_logits in video_model.propagate_in_video(state):
-        f = int(frame_idx)
-        if wanted is not None and f not in wanted:
-            continue
-        m = (mask_logits[0] > 0.0).cpu().numpy()
-        results[str(f)] = {"mask_b64": _encode_mask(m[0]), "area": int(m[0].sum())}
-
-    video_model.reset_state(state)
-    return {"ok": True, "frames": results}
+        results: dict[str, dict] = {}
+        for frame_idx, _obj_ids, mask_logits in video_model.propagate_in_video(state):
+            f = int(frame_idx)
+            if wanted is not None and f not in wanted:
+                continue
+            # OR all object masks into one combined watermark mask
+            combined = np.zeros_like((mask_logits[0] > 0.0).cpu().numpy())
+            for obj_mask_logit in mask_logits:
+                m = (obj_mask_logit > 0.0).cpu().numpy()
+                combined = combined | m
+            results[str(f)] = {
+                "mask_b64": _encode_mask(combined),
+                "area": int(combined.sum()),
+            }
+        return {"ok": True, "frames": results}
+    finally:
+        video_model.reset_state(state)
 
 
 def main() -> int:
