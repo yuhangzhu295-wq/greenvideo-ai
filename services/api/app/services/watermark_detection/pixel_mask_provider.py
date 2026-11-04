@@ -41,6 +41,7 @@ class PixelMaskProvider:
         width: int,
         prompts: dict[int, list[dict]] | None = None,
         total_frames: int = 0,
+        end_frame: int = 0,
         keyframe_interval: int = 30,
         debug_dir: Path | None = None,
     ) -> None:
@@ -48,6 +49,9 @@ class PixelMaskProvider:
         self.height = height
         self.width = width
         self.total_frames = total_frames
+        # Propagation stops here — detections beyond this frame are not tracked
+        # (prevents ghost masks persisting after the watermark disappears).
+        self.end_frame = end_frame if end_frame > 0 else total_frames
         self.keyframe_interval = keyframe_interval
         self.debug_dir = Path(debug_dir) if debug_dir else None
         self.used_fallback = False
@@ -121,22 +125,29 @@ class PixelMaskProvider:
                 # SAM2 can track each watermark instance independently.
                 keyframe_prompts[kf] = [{"box": p["box"]} for p in plist]
 
-            # Phase 2: Propagate masks across the full video using SAM2 video predictor.
-            # This fills in every frame between/after keyframes — without this,
-            # only keyframes had masks and the rest of the video was unmasked.
-            if keyframe_prompts and self.total_frames > len(keyframe_prompts):
-                all_indices = list(range(self.total_frames))
-                prop_result = self.worker.propagate_video(
-                    self.video_path,
-                    prompts=keyframe_prompts,
-                    frame_indices=all_indices,
+            # Phase 2: Propagate masks across the video using SAM2 video predictor.
+            # Bounded by end_frame — masks don't persist after the watermark disappears.
+            if keyframe_prompts:
+                prop_end = (
+                    min(self.end_frame, self.total_frames)
+                    if self.end_frame
+                    else self.total_frames
                 )
-                for f_idx_str, item in prop_result.items():
-                    f_idx = int(f_idx_str)
-                    if self.tracks.mask_for(f_idx) is not None:
-                        continue  # keyframe already has a segmented mask
-                    mask = _dilate_small(item["mask"])
-                    self.tracks.add_mask(f_idx, mask)
+                if prop_end > len(keyframe_prompts):
+                    all_indices = list(range(prop_end))
+                    prop_result = self.worker.propagate_video(
+                        self.video_path,
+                        prompts=keyframe_prompts,
+                        frame_indices=all_indices,
+                    )
+                    for f_idx_str, item in prop_result.items():
+                        f_idx = int(f_idx_str)
+                        if self.tracks.mask_for(f_idx) is not None:
+                            continue  # keyframe already has a segmented mask
+                        if f_idx >= prop_end:
+                            continue  # beyond detection window
+                        mask = _dilate_small(item["mask"])
+                        self.tracks.add_mask(f_idx, mask)
         finally:
             self.worker.stop()
 

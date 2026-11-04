@@ -714,15 +714,26 @@ class WatermarkProcessor:
 
                     debug = Path(mask_debug_dir) if mask_debug_dir else None
                     _total = max_frames if max_frames is not None else total_frames
+                    # Propagation bounded by the last detection's end frame so
+                    # masks don't persist after the watermark disappears.
+                    _end_f = 0
+                    if frame_tracks:
+                        _end_f = max(
+                            (r.timestamp_s and int(r.timestamp_s * fps) or 0)
+                            for r in frame_tracks
+                            if r.boxes
+                        ) if frame_tracks else 0
                     pixel_provider = PixelMaskProvider(
                         input_path, height, width,
                         prompts=pixel_mask_prompts, debug_dir=debug,
-                        total_frames=_total,
+                        total_frames=_total, end_frame=_end_f or _total,
                     )
 
                     _cap_reader = cv2.VideoCapture(str(input_path))
 
                     def _read_frame(f_idx: int):
+                        if cancel_check is not None and cancel_check():
+                            return None
                         _cap_reader.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
                         ret, fr = _cap_reader.read()
                         return fr if ret else None
@@ -731,6 +742,8 @@ class WatermarkProcessor:
                         pixel_provider.build_tracks(_read_frame)
                     finally:
                         _cap_reader.release()
+                    if cancel_check is not None and cancel_check():
+                        raise AiServiceError("SAM2 分割已被用户取消")
                     if progress_cb:
                         progress_cb(14, "SAM 2.1 像素级水印分割完成")
                 except Exception as exc:
