@@ -44,6 +44,7 @@ class PixelMaskProvider:
         end_frame: int = 0,
         keyframe_interval: int = 30,
         debug_dir: Path | None = None,
+        cancel_check=None,
     ) -> None:
         self.video_path = str(video_path)
         self.height = height
@@ -53,6 +54,7 @@ class PixelMaskProvider:
         # (prevents ghost masks persisting after the watermark disappears).
         self.end_frame = end_frame if end_frame > 0 else total_frames
         self.keyframe_interval = keyframe_interval
+        self._cancel_check = cancel_check
         self.debug_dir = Path(debug_dir) if debug_dir else None
         self.used_fallback = False
         self.worker = Sam2Worker()
@@ -125,29 +127,45 @@ class PixelMaskProvider:
                 # SAM2 can track each watermark instance independently.
                 keyframe_prompts[kf] = [{"box": p["box"]} for p in plist]
 
-            # Phase 2: Propagate masks across the video using SAM2 video predictor.
-            # Bounded by end_frame — masks don't persist after the watermark disappears.
+            # Phase 2: Propagate masks in chunks with cancel checks between
+            # windows. Chunking bounds GPU memory per call and allows the
+            # caller to abort mid-propagation (not stuck for 900s).
             if keyframe_prompts:
                 prop_end = (
                     min(self.end_frame, self.total_frames)
                     if self.end_frame
                     else self.total_frames
                 )
-                if prop_end > len(keyframe_prompts):
-                    all_indices = list(range(prop_end))
+                chunk_size = 60
+                start = 0
+                while start < prop_end:
+                    if self._cancel_check and self._cancel_check():
+                        raise RuntimeError("SAM2 传播已被用户取消")
+                    end = min(start + chunk_size, prop_end)
+                    indices = list(range(start, end))
+                    # Only propagate from chunks that contain or follow a keyframe
+                    has_prompt = any(kf in keyframe_prompts for kf in range(start, end))
+                    if not has_prompt and start > 0:
+                        start = end
+                        continue
                     prop_result = self.worker.propagate_video(
                         self.video_path,
-                        prompts=keyframe_prompts,
-                        frame_indices=all_indices,
+                        prompts={
+                            k: v
+                            for k, v in keyframe_prompts.items()
+                            if start <= k < end
+                        },
+                        frame_indices=indices,
                     )
                     for f_idx_str, item in prop_result.items():
                         f_idx = int(f_idx_str)
                         if self.tracks.mask_for(f_idx) is not None:
-                            continue  # keyframe already has a segmented mask
+                            continue
                         if f_idx >= prop_end:
-                            continue  # beyond detection window
+                            continue
                         mask = _dilate_small(item["mask"])
                         self.tracks.add_mask(f_idx, mask)
+                    start = end
         finally:
             self.worker.stop()
 

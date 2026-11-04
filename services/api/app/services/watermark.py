@@ -727,13 +727,12 @@ class WatermarkProcessor:
                         input_path, height, width,
                         prompts=pixel_mask_prompts, debug_dir=debug,
                         total_frames=_total, end_frame=_end_f or _total,
+                        cancel_check=cancel_check,
                     )
 
                     _cap_reader = cv2.VideoCapture(str(input_path))
 
                     def _read_frame(f_idx: int):
-                        if cancel_check is not None and cancel_check():
-                            return None
                         _cap_reader.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
                         ret, fr = _cap_reader.read()
                         return fr if ret else None

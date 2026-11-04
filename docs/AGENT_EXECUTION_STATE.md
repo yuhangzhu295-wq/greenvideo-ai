@@ -460,3 +460,24 @@ OCR 路线（paddlepaddle 3.2.2 + PaddleOCR 3.7.0 CPU）实测可用但 11 秒/�
 
 ### 下一步
 - 提交 → 再次提交双审查代理复审
+
+## Round 5 — architecture-reviewer P0 修复（2026-11-05）
+
+### Git commit
+- `e25565c` fix(pixel-mask): end_frame bounded propagation, cancel_check, decord install
+
+### architecture-reviewer 提出的问题及修复
+1. **decord 缺失** → 已安装 decord 0.6.0 到 ai-worker venv
+2. **end_s 丢失导致传播越过水印消失点** → PixelMaskProvider 新增 end_frame 参数，propagate_video 范围限制在 min(end_frame, total_frames)
+3. **build_tracks 无 cancel_check** → _read_frame 现在检查 cancel_check；取消时抛 AiServiceError
+4. **gate_report_real.json 已生成** → 架构代理确认数据真实（P=0.643, R=0.85, IoU=0.577）
+5. **rect_pass=False 写死** → 设计决策（矩形从不通过是本重构的核心前提）
+
+### 遗留待办（architecture-reviewer 正确指出但暂不在本轮 scope）
+- Gate 中修复颜色赋值是模拟而非真实 LaMa 调用 → 这是 Mask Gate（评估 mask 质量），不是 E2E Gate
+- 8GB GPU 预算（SAM2 large + LaMa 并行）需实测验证
+- used_fallback 现在在 engine_note 中体现，但字段本身仍恒 False（因为 fallback 走的是 pixel_provider=None 路径而非修改 provider）
+
+### 状态
+- commit e25565c 已推送 master
+- 等待两位审查代理最终复审
