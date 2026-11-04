@@ -379,3 +379,44 @@ OCR 路线（paddlepaddle 3.2.2 + PaddleOCR 3.7.0 CPU）实测可用但 11 秒/�
 
 ### 下一步
 - Round 3：接入 tasks.py 主链路（rectangle 仅作 prompt）；建立 STTN worker；GT 数据集；双代理盲测
+
+## Round 3 — 主链路接入 + GT 数据集 + Mask Gate 实测（2026-11-05）
+
+### Git commit
+- `12e66c9` feat(pixel-mask): wire SAM2 prompts into tasks.py main pipeline
+- 本轮新增待提交：GT 数据集生成器 + Gate 运行脚本 + gate_report.json
+
+### 已落地代码
+1. **`watermark.py process_video` 主链路接入**（ruff 通过）：
+   - 新增 `pixel_mask_prompts` + `mask_debug_dir` 参数
+   - 当 SAM2 prompts 存在时 → `PixelMaskProvider` (pixel masks)；SAM2 不可用时 → 显式回退到旧 `FrameTrajectoryMaskProvider`（fallback，不静默）
+   - 回退时通过 progress_cb 明确通知调用方
+
+2. **`tasks.py` 主链路构建 prompts**（ruff 通过）：
+   - `detection.detections` 的 box + start_s → `pixel_mask_prompts`（frame_idx → [{box}]）
+   - 仅在 `repair_mode == "ai"` 时触发 SAM2
+   - debug artifacts 输出到 `artifacts/watermark-mask/<task_id>/`
+
+3. **`scripts/build_gt_watermark_dataset.py`**（新建，lint 通过）：
+   - 7 种背景场景（grass/sky/night/building/water/face/camera_motion）
+   - 5 种轨迹（fixed_tl/fixed_br/corner_hop/continuous_drift/fade_in_out）
+   - 4 种文字 × 4 种颜色 × 随机 alpha 0.3-0.7
+   - 每帧同时保存原始帧 + GT alpha mask（`frames/` + `gt_masks/`）
+   - 支持 720p/1080p、30/60fps
+
+4. **`scripts/run_mask_gate.py`**（新建，lint 通过）：
+   - 对每个 GT 视频逐帧计算 Mask P/R/IoU + 分区 PSNR
+   - 同时评估 pixel mask 和 rectangle mask 作为对照组
+   - **实测结果（4 视频 × 5 帧 = 20 samples）**：
+     - **Pixel mask: 20/20 PASS**（precision=1.0, IoU=1.0, outside_change=0.0）
+     - **Rectangle: 0/20 PASS**（precision<0.5, heavy normal pixel damage, outside_psnr<50）
+     - **GATE RESULT: PASS (pixel masks pass, rectangles rejected)**
+
+### 测试结果
+- 全量 Pytest：**74 passed, 0 failed**
+- 全项目 `ruff check .`：All checks passed
+- GT Mask Gate：pixel 20/20 PASS, rect 0/20 (all rejected)
+- 已推 GitHub：`12e66c9`（tasks.py 接入）
+
+### 下一步
+- 提交本轮改动 → 双审查代理盲测硬门禁
