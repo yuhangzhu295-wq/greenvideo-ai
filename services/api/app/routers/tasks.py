@@ -663,6 +663,17 @@ async def _run_watermark_task_locked(
                     "frame_tracks": tracks_json,
                     "video_width": frame_width,
                     "video_height": frame_height,
+                    "unconfirmed_candidates": (
+                        detection.stats.get("unconfirmed_candidates")
+                        if hasattr(detection, "stats") and detection.stats
+                        else None
+                    ),
+                    "requires_confirmation": bool(
+                        hasattr(detection, "stats")
+                        and detection.stats
+                        and detection.stats.get("unconfirmed_candidates")
+                        and not getattr(detection, "detections", None)
+                    ),
                 },
             )
 
@@ -1035,6 +1046,8 @@ def get_task_status(task_id: str) -> TaskStatusDTO:
         frame_tracks=frame_tracks,
         video_width=video_width,
         video_height=video_height,
+        unconfirmed_candidates=task_input.get("unconfirmed_candidates"),
+        requires_confirmation=bool(task_input.get("requires_confirmation", False)),
         error=task.error,
     )
 
