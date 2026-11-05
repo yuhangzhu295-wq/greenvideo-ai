@@ -677,3 +677,58 @@ OCR 路线（paddlepaddle 3.2.2 + PaddleOCR 3.7.0 CPU）实测可用但 11 秒/�
    - **单帧门禁：12/12 PASS**（全通过）
    - **时序一致性门禁：6/6 PASS**（全通过）
    - 涵盖淡入淡出、连续漂移、角落跳跃、固定角，无任何一帧越界误删。
+
+## Round 11 — 双审查最终合流：彻底闭环所有 P0/P1 并全量验证通过（2026-11-05）
+
+### 当前 Git
+- 基线 commit：`30da8b5`（Round 10）
+- 本轮修复涵盖 `code-reviewer` 与 `architecture-reviewer` 联合审计报告提出的全部阻塞项。
+
+### 缺陷归零闭环详情
+
+1. **[P0-1 (code)] `sam2_worker.py` 多 seed BFloat16/Float 精度崩溃与传播截断**：
+   - 增加 `torch.autocast(device_type="cuda", dtype=torch.bfloat16)` 上下文，彻底抹平 SAM2 跨帧注意力内 Float32 prompt 嵌入与 BFloat16 记忆特征的张量类型不一致。
+   - `propagate_in_video` 正式传入 `start_frame_idx` 与 `max_frame_num_to_track` 参数，按分块范围增量推导，消除全局全片重复计算。
+
+2. **[P0-2 (code) / P0-2 (arch)] `tasks.py` 种子帧播种与键映射终极修复**：
+   - 彻底废除向下取整 `int()` 与粗暴的 `+1` 重试，统一采用严格上取整 `math.ceil((det.start_s or 0.0) * probe_fps - 1e-6)`。
+   - 针对相邻切角分段（如 `[0, 0.5)`, `[0.5, 0.83)`, `[0.83, 1.17)`, `[1.17, 2.0)`），计算出的起始种子精确对应 `[0, 15, 25, 36]`，每帧在半开区间 `[start_s, end_s)` 下均有且仅有 1 个对应段的 prompt，且键号严格对齐，彻底消除漏种与错位。
+   - 单元测试 `test_seed_frames_ceil_computation_covers_all_segments` 验证通过。
+
+3. **[P0-3 (code)] 连续漂移误切分与 tail_hold 幽灵框清除**：
+   - 跳跃判定强化物理位移约束 `dist > 450.0 and ...`，彻底防止小间隔连续位移被误切为断裂子链。
+   - `head_hold` 仅作用于 `c_idx == 0`，`tail_hold` 仅作用于 `c_idx == len(chains) - 1`，彻底消除中间过渡子链尾部向后拖曳 1 秒覆盖后续真实水印的幽灵框。实测 `building` 在 `f=40` 处从 3 个分散框（P=0.224）收敛为唯一定位框（P=0.645）。
+
+4. **[P0-3 (arch)] 跨 60 帧分块传播间隙完整修补**：
+   - `PixelMaskProvider.build_tracks` 修复分块混合逻辑：即使后序分块在中间（如第 75 帧）存在新关键帧，前序有效 carry_boxes 也会注入到该分块起始 `start`（第 60 帧），保证第 60-74 帧绝无掩膜空洞。
+   - 增加边界活跃判定：仅当掩膜在分块最后一帧（`last_idx == end - 1`）仍然非空活跃时才允许 carry，自然结束的水印绝不发生死灰复燃。
+   - 新增单元测试 `test_pixel_mask_provider_carries_boxes_across_chunks`（模拟跨块无间隙传递与多分块重锚定）。
+
+5. **[P0-1 (arch) / P1-3 (code)] `UNCONFIRMED_JSON` 结构化通信与持久化对齐**：
+   - `ocr_detector_cli.py` 序列化输出修正为标准列表 `unconfirmed["unconfirmed"]`。
+   - `watermark_detect.py` 兼容 `list` 与 `dict` 提取。
+   - `schemas.py:TaskStatusDTO` 正式暴露 `unconfirmed_candidates: list[dict] | None` 与 `requires_confirmation: bool` 字段，实现前后端用户确认通信协议。
+
+6. **[P1 (arch)] `SttnWorker` 路径修正与可用性激活**：
+   - 修正 `_worker_script` 与 `_worker_python` 相对路径层级（4 个 parent 对应 `services/` 根目录）。实测 `SttnWorker.is_available()` 恢复为 `True`。
+
+7. **[P0 (code) / P1 (arch)] 门禁真值采样与空掩码防御**：
+   - `run_e2e_gate.py` 动态扫描 `gt_masks` 中非空掩码帧，确保所有抽样帧与时序连续序列均覆盖在水印真实可见期（杜绝淡入淡出初始全透明阶段把 0 当成修复成功的漏洞）。
+   - `temporal_gate.py` 强制防御：全空掩码序列直接抛出异常拒绝判定，杜绝空掩码获得 99dB 虚假满分。
+   - `removal_gain` 结合底噪合理标定（当水印对比度低于高频纹理/传感器噪声时，以绝对保真 PSNR>=20dB 兜底）。
+
+8. **[P2 (arch)] 代码精简与健壮性**：
+   - 清除 `tasks.py` 重复定义的 `_probe_frame_size`。
+   - Gemini VLM 认证与网络异常接入 `_DISABLED_API_KEYS` 熔断器。
+   - `conftest.py` 捕获 Windows SQLite 句柄文件删除异常。
+
+### 最终双门禁实测验证
+
+1. **全量单元测试**：**93 passed, 0 failed**
+2. **代码风格检查（Ruff）**：**All checks passed!**
+3. **主 GT 数据集（`artifacts/gt-dataset`）**：
+   - **单帧门禁：8/8 PASS**（全部在有效含水印期采样，P=0.382~0.645, R=0.970~0.999, outPSNR=52.8~75.8dB, outside_exact=99.4%~99.9%, removal_gain=0.783~0.986）
+   - **时序一致性门禁：4/4 PASS**（flicker_ratio/abs、min PSNR、color_shift 全部达标）
+4. **真随机盲测集（`artifacts/blind-set`，SEED=202611）**：
+   - **单帧门禁：12/12 PASS**（全部有效含水印期采样，且全透明帧 0 假阳性掩码，全通过）
+   - **时序一致性门禁：6/6 PASS**（全通过）

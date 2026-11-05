@@ -154,8 +154,10 @@ class PixelMaskProvider:
                         for k, v in keyframe_prompts.items()
                         if start <= k < end
                     }
-                    if not chunk_prompts and carry_boxes:
-                        chunk_prompts = {start: [{"box": b} for b in carry_boxes]}
+                    if carry_boxes:
+                        chunk_prompts.setdefault(start, []).extend(
+                            [{"box": b} for b in carry_boxes]
+                        )
                     if chunk_prompts:
                         prop_result = self.worker.propagate_video(
                             self.video_path, prompts=chunk_prompts, frame_indices=indices
@@ -171,10 +173,16 @@ class PixelMaskProvider:
                             if f_idx > last_idx:
                                 last_idx, last_mask = f_idx, mask
                         # Re-anchor the next chunk on the last mask's extent:
-                        # SAM2 video state cannot cross separate propagate
-                        # calls, so the bounding box becomes the new prompt.
+                        # only carry forward if the watermark was still active
+                        # at the very boundary of this chunk (last_idx == end - 1).
+                        # If the watermark ended before the chunk boundary,
+                        # carry_boxes stays empty so we don't resurrect ghosts.
                         carry_boxes = []
-                        if last_mask is not None and (last_mask > 0).any():
+                        if (
+                            last_idx == end - 1
+                            and last_mask is not None
+                            and (last_mask > 0).any()
+                        ):
                             ys, xs = np.where(last_mask > 0)
                             carry_boxes = [
                                 [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]

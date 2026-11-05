@@ -263,7 +263,7 @@ def run_detection(
         # Never silently drop a candidate: report it so the caller can ask the
         # user to confirm the region (goal: auto-detect with human fallback).
         print(
-            "UNCONFIRMED_JSON:" + json.dumps(unconfirmed, ensure_ascii=False),
+            "UNCONFIRMED_JSON:" + json.dumps(unconfirmed["unconfirmed"], ensure_ascii=False),
             file=sys.stderr,
         )
     return unconfirmed["confirmed"]

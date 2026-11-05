@@ -22,7 +22,10 @@ from app.db import database_path, engine  # noqa: E402
 db_file = database_path()
 if db_file.exists():
     engine.dispose()
-    db_file.unlink()
+    try:
+        db_file.unlink(missing_ok=True)
+    except PermissionError:
+        pass
 
 
 @pytest.fixture(scope="session", autouse=True)

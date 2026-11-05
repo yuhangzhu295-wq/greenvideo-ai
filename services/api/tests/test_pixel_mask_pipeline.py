@@ -116,3 +116,45 @@ def test_repair_quality_outside_region_guard():
     assert q_bad["outside_psnr"] < q["outside_psnr"] - 20, (
         "bad repair must be dramatically worse than pixel-level repair"
     )
+
+
+def test_pixel_mask_provider_carries_boxes_across_chunks(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from app.services.watermark_detection.pixel_mask_provider import PixelMaskProvider
+
+    mock_worker = MagicMock()
+    # Dummy mask to return
+    dummy_mask = np.zeros((100, 100), dtype=np.uint8)
+    dummy_mask[10:30, 20:50] = 255
+
+    mock_worker.segment_frame.return_value = {"mask": dummy_mask, "area": 600}
+
+    chunk_calls = []
+
+    def mock_propagate(video_path, prompts, frame_indices):
+        chunk_calls.append({"prompts": prompts, "indices": frame_indices})
+        return {str(idx): {"mask": dummy_mask, "area": 600} for idx in frame_indices}
+
+    mock_worker.propagate_video.side_effect = mock_propagate
+    target = "app.services.watermark_detection.pixel_mask_provider.Sam2Worker"
+    monkeypatch.setattr(target, lambda: mock_worker)
+
+    # 120-frame video with a prompt at frame 0 only
+    prompts = {0: [{"box": [20, 10, 30, 20]}]}
+    provider = PixelMaskProvider("dummy.mp4", 100, 100, prompts=prompts, total_frames=120)
+    provider.build_tracks(lambda idx: np.zeros((100, 100, 3), dtype=np.uint8))
+
+    # Must have 2 chunks: 0..59 and 60..119
+    assert len(chunk_calls) == 2, f"expected 2 chunks, got {len(chunk_calls)}"
+    assert chunk_calls[0]["indices"] == list(range(0, 60))
+    assert 0 in chunk_calls[0]["prompts"]
+
+    # Chunk 2 must have carried the box from Chunk 1 at frame 60!
+    assert chunk_calls[1]["indices"] == list(range(60, 120))
+    assert 60 in chunk_calls[1]["prompts"], "frame 60 must be seeded by carry_boxes"
+    assert len(chunk_calls[1]["prompts"][60]) == 1
+    # Frame 60 carried box must match the last mask bounding box
+    carried_box = chunk_calls[1]["prompts"][60][0]["box"]
+    assert carried_box[0] == 20 or carried_box[0] <= 20
+

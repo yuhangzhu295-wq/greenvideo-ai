@@ -178,23 +178,6 @@ def _probe_total_frames(path: Path) -> int:
         return 0
 
 
-def _probe_frame_size(path: Path) -> tuple[int, int]:
-    """(width, height) of a video, or (0, 0) when unreadable."""
-    try:
-        import cv2
-
-        cap = cv2.VideoCapture(str(path))
-        if not cap.isOpened():
-            cap.release()
-            return (0, 0)
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        cap.release()
-        return (max(0, w), max(0, h))
-    except Exception:
-        return (0, 0)
-
-
 def _region_coverage_pct(regions: list[MaskRegion], width: int = 0, height: int = 0) -> float:
     """Share of the frame covered by the union of the given regions."""
     if not regions:
@@ -749,19 +732,22 @@ async def _run_watermark_task_locked(
                 and getattr(detection, "detections", None)
             ):
                 try:
+                    import math
+
                     from app.services.watermark_detect import frame_prompts_at
 
                     probe_fps = _probe_fps(source_path)
                     probe_total = _probe_total_frames(source_path)
                     probe_w, probe_h = _probe_frame_size(source_path)
                     pixel_mask_prompts = {}
-                    # Seed each detection at its start frame; when rounding
-                    # puts the seed just BEFORE the segment starts (int()
-                    # truncation, e.g. 0.83s*30 -> 24 -> t=0.80 < 0.83), retry
-                    # one frame later so the segment is actually seeded.
+                    # Seed each detection at its exact first active frame:
+                    # ceil(start_s * fps) guarantees frame/fps >= start_s,
+                    # so under half-open intervals [start_s, end_s) the prompt
+                    # always queries into the new segment, never catching the
+                    # prior segment or missing the boundary.
                     seed_frames = sorted(
                         {
-                            max(0, int((det.start_s or 0.0) * probe_fps))
+                            max(0, math.ceil((det.start_s or 0.0) * probe_fps - 1e-6))
                             for det in detection.detections
                         }
                     )
@@ -770,11 +756,6 @@ async def _run_watermark_task_locked(
                             detection.detections, f0, probe_fps, probe_total,
                             width=probe_w, height=probe_h,
                         )
-                        if not boxes:
-                            boxes = frame_prompts_at(
-                                detection.detections, f0 + 1, probe_fps, probe_total,
-                                width=probe_w, height=probe_h,
-                            )
                         for xyxy in boxes:
                             x1, y1, x2, y2 = xyxy
                             pixel_mask_prompts.setdefault(f0, []).append(

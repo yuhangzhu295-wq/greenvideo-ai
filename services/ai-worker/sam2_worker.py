@@ -96,59 +96,76 @@ def _run_segment_image(image_predictor, req) -> dict:
 
 
 def _run_propagate_video(video_model, req) -> dict:
+    import contextlib
     import numpy as np
+    import torch
 
     video_path = req["video_path"]
     prompts = req.get("prompts", {})  # {frame_idx: {"box": [...]} }
     frame_filter = req.get("frame_indices")
     wanted = set(int(i) for i in frame_filter) if frame_filter is not None else None
 
-    state = video_model.init_state(video_path)
-    try:
-        # Support multiple objects per frame (multi-watermark): each prompt
-        # entry gets its own obj_id so SAM2 tracks them independently.
-        obj_id = 0
-        for f_idx_raw, plist in prompts.items():
-            f_idx = int(f_idx_raw)
-            entries = plist if isinstance(plist, list) else [plist]
-            for p in entries:
-                if p.get("box"):
-                    video_model.add_new_points_or_box(
-                        state,
-                        frame_idx=f_idx,
-                        obj_id=obj_id,
-                        box=np.array(p["box"], dtype=np.float32),
-                    )
-                    obj_id += 1
-                elif p.get("points"):
-                    labels = p.get("labels") or [1] * len(p["points"])
-                    video_model.add_new_points_or_box(
-                        state,
-                        frame_idx=f_idx,
-                        obj_id=obj_id,
-                        points=np.array(p["points"], dtype=np.float32),
-                        labels=np.array(labels, dtype=np.int32),
-                    )
-                    obj_id += 1
+    # Autocast to bfloat16 on CUDA: SAM2 video attention uses bfloat16 internally,
+    # and adding prompts on multiple different keyframes creates float32
+    # embeddings for unobserved steps. Autocasting unifies the dtypes and
+    # prevents "mat1 and mat2 must have the same dtype (BFloat16 and Float)".
+    autocast_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if torch.cuda.is_available()
+        else contextlib.nullcontext()
+    )
 
-        results: dict[str, dict] = {}
-        for frame_idx, _obj_ids, mask_logits in video_model.propagate_in_video(state):
-            f = int(frame_idx)
-            if wanted is not None and f not in wanted:
-                continue
-            # OR all object masks into one combined watermark mask
-            combined = np.zeros_like((mask_logits[0] > 0.0).cpu().numpy())
-            for obj_mask_logit in mask_logits:
-                m = (obj_mask_logit > 0.0).cpu().numpy()
-                combined = combined | m
-            combined = np.squeeze(combined)  # ensure (H, W) for cv2.imencode
-            results[str(f)] = {
-                "mask_b64": _encode_mask(combined),
-                "area": int(combined.sum()),
-            }
-        return {"ok": True, "frames": results}
-    finally:
-        video_model.reset_state(state)
+    with torch.inference_mode(), autocast_ctx:
+        state = video_model.init_state(video_path)
+        try:
+            # Support multiple objects per frame (multi-watermark): each prompt
+            # entry gets its own obj_id so SAM2 tracks them independently.
+            obj_id = 0
+            for f_idx_raw, plist in prompts.items():
+                f_idx = int(f_idx_raw)
+                entries = plist if isinstance(plist, list) else [plist]
+                for p in entries:
+                    if p.get("box"):
+                        video_model.add_new_points_or_box(
+                            state,
+                            frame_idx=f_idx,
+                            obj_id=obj_id,
+                            box=np.array(p["box"], dtype=np.float32),
+                        )
+                        obj_id += 1
+                    elif p.get("points"):
+                        labels = p.get("labels") or [1] * len(p["points"])
+                        video_model.add_new_points_or_box(
+                            state,
+                            frame_idx=f_idx,
+                            obj_id=obj_id,
+                            points=np.array(p["points"], dtype=np.float32),
+                            labels=np.array(labels, dtype=np.int32),
+                        )
+                        obj_id += 1
+
+            start_f = min(wanted) if wanted else None
+            max_f = len(wanted) if wanted else None
+            results: dict[str, dict] = {}
+            for frame_idx, _obj_ids, mask_logits in video_model.propagate_in_video(
+                state, start_frame_idx=start_f, max_frame_num_to_track=max_f
+            ):
+                f = int(frame_idx)
+                if wanted is not None and f not in wanted:
+                    continue
+                # OR all object masks into one combined watermark mask
+                combined = np.zeros_like((mask_logits[0] > 0.0).cpu().numpy())
+                for obj_mask_logit in mask_logits:
+                    m = (obj_mask_logit > 0.0).cpu().numpy()
+                    combined = combined | m
+                combined = np.squeeze(combined)  # ensure (H, W) for cv2.imencode
+                results[str(f)] = {
+                    "mask_b64": _encode_mask(combined),
+                    "area": int(combined.sum()),
+                }
+            return {"ok": True, "frames": results}
+        finally:
+            video_model.reset_state(state)
 
 
 def main() -> int:

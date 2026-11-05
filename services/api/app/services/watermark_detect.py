@@ -1378,7 +1378,10 @@ def _sightings_to_moving_detections(
         cp = (prev_h[1][0] + prev_h[1][2] / 2.0, prev_h[1][1] + prev_h[1][3] / 2.0)
         cc = (h[1][0] + h[1][2] / 2.0, h[1][1] + h[1][3] / 2.0)
         dist = math.hypot(cc[0] - cp[0], cc[1] - cp[1])
-        is_jump = (dist > 450 and dt <= 0.8) or (dt > 0 and (dist / dt) > 1200.0)
+        # A jump must have large physical displacement (corner hop >450px).
+        # Small per-frame movements at short dt must never be classified as
+        # jumps, otherwise continuous drift gets shattered into overlapping chains.
+        is_jump = dist > 450.0 and (dt <= 0.8 or (dt > 0 and (dist / dt) > 1500.0))
         if is_jump:
             chains.append(current_chain)
             current_chain = [h]
@@ -1586,10 +1589,11 @@ def _sightings_to_moving_detections(
                     )
                 )
 
+            # Tail hold only applies to the final chain in the video;
+            # intermediate chains transition to the next chain and must NOT
+            # linger as ghost boxes until the end of the video.
             hold_dur = max_dur - ch_hits[-1][0]
-            if 0.15 < hold_dur <= 1.0:
-                # Hold-grow covers the tail between the last sighting and the video end;
-                # beyond 1.4x the prompt inflates and mask precision collapses.
+            if c_idx == len(chains) - 1 and 0.15 < hold_dur <= 1.0:
                 grow = 1.4
                 lb = ch_hits[-1][1]
                 hw, hh = int(lb[2] * grow), int(lb[3] * grow)
@@ -1607,7 +1611,7 @@ def _sightings_to_moving_detections(
                     )
                 )
             head_hold = ch_hits[0][0]
-            if 0.15 < head_hold <= 1.0:
+            if c_idx == 0 and 0.15 < head_hold <= 1.0:
                 grow = 1.4
                 fb = ch_hits[0][1]
                 hw, hh = int(fb[2] * grow), int(fb[3] * grow)
@@ -1905,7 +1909,7 @@ def detect_timed_watermarks_hybrid(video_path: Path | str) -> DetectionResult:
                 "--end-frame",
                 str(content_end_frame),
                 "--sample-sec",
-                "1.5",
+                "0.75",
             ]
             proc = subprocess.run(cmd, capture_output=True, timeout=600, check=False)
             stdout = proc.stdout.decode("utf-8", errors="replace")
@@ -1927,6 +1931,8 @@ def detect_timed_watermarks_hybrid(video_path: Path | str) -> DetectionResult:
                     batch = json.loads(line.removeprefix("UNCONFIRMED_JSON:"))
                 except Exception:
                     continue
+                if isinstance(batch, dict) and "unconfirmed" in batch:
+                    batch = batch["unconfirmed"]
                 if isinstance(batch, list):
                     unconfirmed_candidates.extend(batch)
             if unconfirmed_candidates:
@@ -2093,6 +2099,9 @@ def detect_timed_watermarks_hybrid(video_path: Path | str) -> DetectionResult:
     res = detect_watermarks(fallback_frames)
     res.outro_cut_frame = outro_cut_frame
     res.outro_cut_s = outro_cut_s
+    if ocr_unconfirmed_global:
+        res.stats["unconfirmed_candidates"] = ocr_unconfirmed_global[:20]
+        res.stats["unconfirmed_count"] = len(ocr_unconfirmed_global)
     if res.detections:
         res.frame_tracks = track_watermarks_dense(
             video_path, res.detections, max_frames=content_end_frame

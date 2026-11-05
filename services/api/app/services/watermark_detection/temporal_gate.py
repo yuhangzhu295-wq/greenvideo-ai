@@ -67,6 +67,8 @@ def evaluate_temporal_consistency(
     rep = np.stack(repaired).astype(np.float32)
     cln = np.stack(clean).astype(np.float32)
     mk = np.stack([m > 0 for m in masks])
+    if not mk.any():
+        raise ValueError("cannot evaluate temporal consistency on all-empty mask sequence")
 
     # Flicker: temporal deltas inside the mask, repaired vs clean.
     rep_delta = np.abs(np.diff(rep, axis=0)).mean(axis=3)

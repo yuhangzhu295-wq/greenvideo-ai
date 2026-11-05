@@ -201,6 +201,9 @@ def call_gemini_grounding(
             resp = client.post(url, json=payload)
             if resp.status_code != 200:
                 logger.warning("Gemini VLM API error %d: %s", resp.status_code, resp.text[:200])
+                if resp.status_code in (400, 401, 403):
+                    _DISABLED_API_KEYS.add(api_key)
+                    logger.warning("Gemini API key 认证失败，禁用该 key 自动回退本地 OCR")
                 return VLMVideoAnalysisResult(
                     ok=False, reason=f"GEMINI_API_ERROR_{resp.status_code}"
                 )
@@ -250,6 +253,8 @@ def call_gemini_grounding(
 
     except Exception as exc:
         logger.warning("Gemini grounding request exception: %s", exc)
+        _DISABLED_API_KEYS.add(api_key)
+        logger.warning("Gemini 网络连接异常，禁用该 key 自动回退本地 OCR")
         return VLMVideoAnalysisResult(ok=False, reason=f"EXCEPTION_{exc}")
 
 

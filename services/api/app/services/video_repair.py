@@ -240,11 +240,11 @@ class SttnWorker:
     """
 
     _worker_script = (
-        Path(__file__).resolve().parent.parent.parent.parent.parent
+        Path(__file__).resolve().parent.parent.parent.parent
         / "sttn-worker" / "sttn_worker.py"
     )
     _worker_python = (
-        Path(__file__).resolve().parent.parent.parent.parent.parent
+        Path(__file__).resolve().parent.parent.parent.parent
         / "ai-worker" / ".venv" / "Scripts" / "python.exe"
     )
 

@@ -76,3 +76,23 @@ def test_prompts_capped_by_score():
     ]
     prompts = frame_prompts_at(dets, 5, 30.0, 60, 1280, 720)
     assert len(prompts) == 3
+
+
+def test_seed_frames_ceil_computation_covers_all_segments():
+    import math
+
+    dets = [
+        _det((18, 60, 310, 34), 0.0, 0.5),
+        _det((976, 58, 306, 34), 0.5, 0.83),
+        _det((14, 626, 318, 42), 0.83, 1.17),
+        _det((974, 626, 306, 42), 1.17, 2.0),
+    ]
+    fps = 30.0
+    seeds = sorted({max(0, math.ceil((d.start_s or 0.0) * fps - 1e-6)) for d in dets})
+    assert seeds == [0, 15, 25, 36]
+    for idx, f in enumerate(seeds):
+        p = frame_prompts_at(dets, f, fps, 60, 1280, 720)
+        assert len(p) == 1, f"seed frame {f} should have exactly 1 box"
+        expected_x1 = [18, 976, 14, 974][idx]
+        assert p[0][0] == expected_x1
+

@@ -119,6 +119,8 @@ class TaskStatusDTO(BaseModel):
     frame_tracks: list[dict] | None = None
     video_width: int | None = None
     video_height: int | None = None
+    unconfirmed_candidates: list[dict] | None = None
+    requires_confirmation: bool = False
     error: str | None = None
 
 
