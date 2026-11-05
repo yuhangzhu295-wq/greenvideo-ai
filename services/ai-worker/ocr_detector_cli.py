@@ -18,9 +18,8 @@ os.environ["MKL_NUM_THREADS"] = "4"
 import argparse
 import json
 import sys
-from pathlib import Path
+
 import cv2
-import numpy as np
 
 # Platform identifiers act ONLY as a prior (confidence boost + single-sighting
 # allowance). They never gate whether a text candidate is collected.
@@ -70,7 +69,13 @@ def _is_platform_text(text: str) -> bool:
     return any(k in t for k in STRONG_PLATFORM_KEYWORDS)
 
 
-def run_detection(video_path: str, end_frame: int | None = None, sample_sec: float = 1.0, raw: bool = False, start_frame: int = 0) -> list[dict]:
+def run_detection(
+    video_path: str,
+    end_frame: int | None = None,
+    sample_sec: float = 1.0,
+    raw: bool = False,
+    start_frame: int = 0,
+) -> list[dict]:
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -113,7 +118,8 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
         t_sec = f_idx / fps
         cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
         ret, frame = cap.read()
-        if not ret: break
+        if not ret:
+            break
 
         # OCR accuracy on watermark text holds at long-edge ~960, and PaddleOCR
         # cost scales with pixel count: downscaling large frames cuts the dense
@@ -126,18 +132,19 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
                 frame, None, fx=ocr_scale, fy=ocr_scale, interpolation=cv2.INTER_AREA
             )
 
-        def _collect(img, out_list):
+        def _collect(img, out_list, cur_scale=ocr_scale, cur_t=t_sec):
             """Run one OCR pass and append surviving candidates to out_list."""
             res = ocr.predict(img)
-            inv = 1.0 / ocr_scale
+            inv = 1.0 / cur_scale
             for r in res:
                 texts = r.get("rec_texts")
                 scores = r.get("rec_scores")
                 boxes = r.get("rec_boxes")
                 if texts is None or boxes is None or scores is None:
                     continue
-                for txt, sc, b in zip(texts, scores, boxes):
-                    if sc < 0.5: continue
+                for txt, sc, b in zip(texts, scores, boxes, strict=False):
+                    if sc < 0.5:
+                        continue
                     # Map boxes from the downscaled OCR frame back to full-frame
                     # pixels; all padding/safety math below runs in full-frame
                     # coordinates.
@@ -146,25 +153,31 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
                     bx2 = int(b[2] * inv)
                     by2 = int(b[3] * inv)
                     bw, bh = bx2 - bx1, by2 - by1
-                    if bw <= 0 or bh <= 0: continue
+                    if bw <= 0 or bh <= 0:
+                        continue
 
                     txt_lower = txt.lower()
                     platform = _is_platform_text(txt_lower)
                     # Center check: scene content in the center (actor, clothes,
-                    # props) is protected. A platform prior or a high score is
-                    # required to touch it; the tight OCR box is preserved for
-                    # the caller either way.
-                    if in_center_safety_zone(bx1, by1, bw, bh) and not platform and sc < 0.92:
+                    # props) is protected in the AUTO path. Raw (trajectory)
+                    # sightings are matched by text downstream, and a drifting
+                    # watermark legitimately crosses the center, so the score
+                    # gate must not amputate its path.
+                    if (in_center_safety_zone(bx1, by1, bw, bh)
+                            and not platform and sc < 0.92 and not raw):
                         continue
 
                     # Tight box = what OCR actually read (used as the SAM prompt
                     # and for trajectory geometry). Padded box = search context.
                     tight = (bx1, by1, bw, bh)
 
-                    # Logo icon is typically to the left of the platform text (e.g. Douyin 'd' note, Kuaishou camera).
-                    # Expand left only when adjacent to the platform logo header; for normal text lines,
-                    # use tight padding so dark frame borders (like sky) are preserved for inpainting context.
-                    is_logo_header = any(k in txt_lower for k in ("抖音", "快手", "小红书", "bilibili", "douyin", "kuaishou", "豆包", "剪映", "视频号")) or len(txt) <= 3
+                    # Logo icon is typically to the left of the platform text.
+                    # Expand left only when adjacent to the platform logo header.
+                    logo_keys = (
+                        "抖音", "快手", "小红书", "bilibili", "douyin",
+                        "kuaishou", "豆包", "剪映", "视频号",
+                    )
+                    is_logo_header = any(k in txt_lower for k in logo_keys) or len(txt) <= 3
                     if is_logo_header:
                         pad_left = min(int(bh * 1.45), int(width * 0.09))
                         pad_right = max(16, int(bh * 0.55))
@@ -181,14 +194,14 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
                     fx2 = min(width, bx2 + pad_right)
                     fy2 = min(height, by2 + pad_bot)
 
-                    # Companion avatar/icon expansion on left side (e.g. Xiaohongshu avatar at left of nickname)
+                    # Companion avatar/icon expansion on left side (e.g. nickname avatar)
                     if int(width * 0.03) <= bx1 <= int(width * 0.30):
                         fx1 = max(0, bx1 - int(bh * 4.0))
                         if fx1 <= int(width * 0.08):
                             fx1 = 0
                         fy1 = max(0, by1 - max(pad_top, int(bh * 0.50)))
                         fy2 = min(height, by2 + max(pad_bot, int(bh * 0.50)))
-                    # Companion avatar/icon expansion on right side (e.g. Xiaohongshu avatar at right of nickname)
+                    # Companion avatar/icon expansion on right side (e.g. nickname avatar)
                     if int(width * 0.70) <= bx2 <= int(width * 0.97):
                         fx2 = min(width, bx2 + int(bh * 4.0))
                         if fx2 >= int(width * 0.92):
@@ -197,7 +210,7 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
                         fy2 = min(height, by2 + max(pad_bot, int(bh * 0.50)))
 
                     out_list.append({
-                        "time_s": t_sec,
+                        "time_s": cur_t,
                         "box": (fx1, fy1, fx2 - fx1, fy2 - fy1),
                         "tight_box": tight,
                         "text": txt,
@@ -246,7 +259,7 @@ def run_detection(video_path: str, end_frame: int | None = None, sample_sec: flo
     unconfirmed = _cluster_and_classify(
         raw_candidates, width, height, max_dur
     )
-    if unconfirmed:
+    if unconfirmed["unconfirmed"]:
         # Never silently drop a candidate: report it so the caller can ask the
         # user to confirm the region (goal: auto-detect with human fallback).
         print(
@@ -330,13 +343,12 @@ def _cluster_and_classify(
             else:
                 prev_list.append(c)
 
+        # Moving-vs-resting is a GEOMETRIC decision (centroid spread between
+        # sub-clusters); the platform prior must never branch this — gating
+        # it on keywords merged a hopping platform watermark into one
+        # full-screen box and froze non-platform drifters in place.
         multi_sub = len(sub_clusters) > 1
-        if multi_sub and platform:
-            # A drifting platform watermark with sparse sightings still moves;
-            # keep the entity whole and let the dense tracker reconstruct it.
-            is_moving = _entity_is_moving(sub_clusters, width, height)
-        else:
-            is_moving = False
+        is_moving = multi_sub and _entity_is_moving(sub_clusters, width, height)
 
         if multi_sub and not is_moving:
             # One static detection per resting position, time windows split at
@@ -357,7 +369,9 @@ def _cluster_and_classify(
                     0.0 if prev_end is None else round((prev_end + sc_list[0]["time_s"]) / 2.0, 2)
                 )
                 end_s = (
-                    max_dur if next_start is None else round((sc_list[-1]["time_s"] + next_start) / 2.0, 2)
+                    max_dur
+                    if next_start is None
+                    else round((sc_list[-1]["time_s"] + next_start) / 2.0, 2)
                 )
                 det = _entity_result(
                     sc_list, start_s, end_s, is_moving=False,
@@ -461,7 +475,7 @@ def _entity_result(
         "end_s": round(end_s, 2),
         "times": [round(float(t), 2) for t in sorted({c["time_s"] for c in sc_list})],
         "confidence": round(
-            float(best_score) + (0.1 if (platform and persistent) else 0.0), 3
+            min(1.0, float(best_score) + (0.1 if (platform and persistent) else 0.0)), 3
         ),
         "texts": list({c["text"] for c in sc_list})[:3],
         "is_moving": is_moving,

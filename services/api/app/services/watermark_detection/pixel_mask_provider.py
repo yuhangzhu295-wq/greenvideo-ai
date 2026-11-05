@@ -100,6 +100,8 @@ class PixelMaskProvider:
 
         ``frame_reader(frame_index)`` returns the BGR frame (or None).
         """
+        import numpy as np
+
         if not self._prompts:
             return
 
@@ -138,33 +140,45 @@ class PixelMaskProvider:
                 )
                 chunk_size = 60
                 start = 0
+                # Tracks the last propagated mask; a chunk without its own
+                # keyframe re-seeds from it, otherwise a 120-frame video with
+                # a single frame-0 seed would leave frames 60+ unmasked.
+                carry_boxes: list[list[int]] = []
                 while start < prop_end:
                     if self._cancel_check and self._cancel_check():
                         raise RuntimeError("SAM2 传播已被用户取消")
                     end = min(start + chunk_size, prop_end)
                     indices = list(range(start, end))
-                    # Only propagate from chunks that contain or follow a keyframe
-                    has_prompt = any(kf in keyframe_prompts for kf in range(start, end))
-                    if not has_prompt and start > 0:
-                        start = end
-                        continue
-                    prop_result = self.worker.propagate_video(
-                        self.video_path,
-                        prompts={
-                            k: v
-                            for k, v in keyframe_prompts.items()
-                            if start <= k < end
-                        },
-                        frame_indices=indices,
-                    )
-                    for f_idx_str, item in prop_result.items():
-                        f_idx = int(f_idx_str)
-                        if self.tracks.mask_for(f_idx) is not None:
-                            continue
-                        if f_idx >= prop_end:
-                            continue
-                        mask = _dilate_small(item["mask"])
-                        self.tracks.add_mask(f_idx, mask)
+                    chunk_prompts = {
+                        k: v
+                        for k, v in keyframe_prompts.items()
+                        if start <= k < end
+                    }
+                    if not chunk_prompts and carry_boxes:
+                        chunk_prompts = {start: [{"box": b} for b in carry_boxes]}
+                    if chunk_prompts:
+                        prop_result = self.worker.propagate_video(
+                            self.video_path, prompts=chunk_prompts, frame_indices=indices
+                        )
+                        last_idx = -1
+                        last_mask = None
+                        for f_idx_str, item in prop_result.items():
+                            f_idx = int(f_idx_str)
+                            if f_idx >= prop_end:
+                                continue
+                            mask = _dilate_small(item["mask"])
+                            self.tracks.add_mask(f_idx, mask)
+                            if f_idx > last_idx:
+                                last_idx, last_mask = f_idx, mask
+                        # Re-anchor the next chunk on the last mask's extent:
+                        # SAM2 video state cannot cross separate propagate
+                        # calls, so the bounding box becomes the new prompt.
+                        carry_boxes = []
+                        if last_mask is not None and (last_mask > 0).any():
+                            ys, xs = np.where(last_mask > 0)
+                            carry_boxes = [
+                                [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+                            ]
                     start = end
         finally:
             self.worker.stop()

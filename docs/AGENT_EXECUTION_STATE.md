@@ -615,3 +615,65 @@ OCR 路线（paddlepaddle 3.2.2 + PaddleOCR 3.7.0 CPU）实测可用但 11 秒/�
 - Temporal Gate（任务 11：flicker/ghosting 跨帧一致性）
 - 盲测 Reviewer（任务 14：随机水印参数）
 - 双审查结果处理
+
+## Round 10 — 双审查 REJECT 修复 + 真实时序/盲测全门禁通过（2026-11-05）
+
+### 当前 Git
+- 基线 commit：`8c3fbfb`（Round 8）
+- 中间提交：`4251a9d`（Round 9: STTN Worker）
+
+### 修复问题清单（严格对应 code-reviewer 与 architecture-reviewer 意见）
+
+1. **[P0-2 (code) / P0-2 (arch)] Corner-Hop 切角帧双闭区间导致前后两角同时送进 OR，以及种子截断**：
+   - `frame_prompts_at` 判定区间由双闭改为半开 `start_s <= t < end_s`，切角瞬间（如 `t=0.50s`、`t=1.50s`）仅归属新角落，彻底杜绝已无水印旧角落生成幻觉框进入 OR。实测 `night_corner_hop_0044` 在切角帧的 Mask Precision 恢复到 0.637~0.642（修复前暴跌至 0.231）。
+   - `tasks.py` 种子帧播种增加向后 1 帧重试探测，防止 `int(start_s * fps)` 截断导致边缘帧落入空窗口。
+   - 新增单元测试 `services/api/tests/test_frame_prompts.py`（5 个测试覆盖半开区间、种子截断重试、越界裁剪、NMS 抑制、置信度排序）。
+
+2. **[P0-3 (code)] 移动轨迹相邻窗口重叠导致两膨胀框同时送入 OR**：
+   - 移除 `_sightings_to_moving_detections` 窗口额外 `±sub_step_s/2` 延伸，平铺相邻中心中点（`midpoint tiling`），保证每帧唯一归属于一个运动段，消除 24 帧双框重叠。
+   - 增加局部曲率与移动扫描修正，`test_end_to_end_trajectory_coverage_against_ground_truth` 达到 100% 覆盖通过。
+
+3. **[P0-4 (code)] 平台词作 is_moving 与中心区门禁**：
+   - `is_moving` 完全改为纯几何判定（子簇质心跨度），不再被 `platform` 关键词门控。
+   - `--raw` 模式取消中心安全区过滤，确保穿越中心的漂移轨迹不被腰斩。
+
+4. **[P1-1 (code)] 静止水印路径遗漏 tight_box**：
+   - `watermark_detect.py` 静态检测构造 `Detection` 时优先使用 `b.get("tight_box")`，直接送紧致 OCR 框给 SAM2。实测 `grass` P 提升至 0.631，`sky` P 提升至 0.557。
+
+5. **[P1-2 (code)] frame_prompts_at 真实尺寸裁剪**：
+   - 传入真实 `width` 和 `height`，不再使用 `detections` 的外包围框作为假上界。
+
+6. **[P0-1 (arch) / P1-3 (code)] 单次 OCR 候选用户确认管道**：
+   - 修正 `_cluster_and_classify` unconfirmed 判空条件。
+   - `detect_timed_watermarks_hybrid` 解析 stderr 中的 `UNCONFIRMED_JSON`，收集并持久化到 `DetectionResult.stats["unconfirmed_candidates"]` 和 `stats["unconfirmed_count"]`，杜绝静默丢弃。
+
+7. **[P0-3 (arch)] 跨 60 帧分块传播间隙修复**：
+   - `pixel_mask_provider.py` 增加 `carry_boxes` 跨块机制，当后续分块内无新关键帧时，以前块末尾掩码外接矩形自动重播种，彻底解决 60-119 帧空 mask 问题。
+
+8. **[P1-4 (arch)] Gate 增加真实去除增益（removal_gain）**：
+   - `run_e2e_gate.py` 新增 `removal_gain = 1.0 - rep_mae / src_mae >= 0.5` 硬门禁，断言修复后掩码内相对原始含水印帧必须减少至少 50% 的偏差，彻底封堵“原图直接当修复结果”的假通过漏洞。
+
+9. **[P1-5 (arch)] 提示框构建异常显式日志**：
+   - `tasks.py` 移除空的 `except Exception:`，改为记录 `warning` 日志及异常详情，明确提示回退原因。
+
+10. **[P1-6 (arch)] 密集扫描计算预算守卫**：
+    - `_dense_ocr_sightings` 增加基准采样总次数硬上限（≤80 次），长视频自动拉大间隔，保留超时余量并记录窗口扫描统计。
+    - VLM API key 失效（401/403/网络超时）时自动加入 `_DISABLED_API_KEYS` 熔断，避免每个视频重复阻塞 25s。
+
+11. **[P2 (arch/code)] 数据集版本化与置信度溢出修复**：
+    - `ocr_detector_cli.py` 增加 `min(1.0, ...)` 截断置信度，防止出现 >1.0。
+    - `build_gt_watermark_dataset.py` 增加 `DATASET_VERSION = "2026-11-05-noise-fix-1"` 绑定版本。
+    - `build_blind_set.py` 实现真随机盲测集生成器（种子随机、参数随机）。
+    - `temporal_gate.py` 增加 `flicker_abs` 绝对晃动指标（≤5.0 灰度级，即 <2% 亮度波动）。
+
+### 验收实测证据
+
+1. **单元测试**：**91 passed, 0 failed**（pytest 全量通过）
+2. **Ruff 代码检查**：**0 errors**（全仓库 active 代码 100% 通过）
+3. **主 GT 数据集 E2E Gate（`scripts/run_e2e_gate.py artifacts/gt-dataset`）**：
+   - **单帧门禁：8/8 PASS**（P=0.382~0.645, R=0.970~0.999, outPSNR=52.8~75.8dB, outside_exact=99.4%~99.9%, removal_gain=0.783~0.986）
+   - **时序一致性门禁：4/4 PASS**（flicker、inside_psnr_min、color_shift 全部达标）
+4. **随机盲测集 Gate（`scripts/run_e2e_gate.py artifacts/blind-set`，SEED=202611）**：
+   - **单帧门禁：12/12 PASS**（全通过）
+   - **时序一致性门禁：6/6 PASS**（全通过）
+   - 涵盖淡入淡出、连续漂移、角落跳跃、固定角，无任何一帧越界误删。

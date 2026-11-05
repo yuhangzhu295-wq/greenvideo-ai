@@ -1,11 +1,11 @@
 ''' Spatial-Temporal Transformer Networks
 '''
-import numpy as np
 import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.models as models
+
 # Vendored from researchmm/STTN (MIT); the upstream absolute import assumes the
 # repo root on sys.path — this package layout needs a relative import.
 from .core.spectral_norm import spectral_norm as _spectral_norm
@@ -13,7 +13,7 @@ from .core.spectral_norm import spectral_norm as _spectral_norm
 
 class BaseNetwork(nn.Module):
     def __init__(self):
-        super(BaseNetwork, self).__init__()
+        super().__init__()
 
     def print_network(self):
         if isinstance(self, list):
@@ -66,7 +66,7 @@ class BaseNetwork(nn.Module):
 
 class InpaintGenerator(BaseNetwork):
     def __init__(self, init_weights=True):
-        super(InpaintGenerator, self).__init__()
+        super().__init__()
         channel = 256
         stack_num = 8
         patchsize = [(108, 60), (36, 20), (18, 10), (9, 5)]
@@ -221,7 +221,7 @@ class MultiHeadedAttention(nn.Module):
 # Standard 2 layerd FFN of transformer
 class FeedForward(nn.Module):
     def __init__(self, d_model):
-        super(FeedForward, self).__init__()
+        super().__init__()
         # We set d_ff as a default to 2048
         self.conv = nn.Sequential(
             nn.Conv2d(d_model, d_model, kernel_size=3, padding=2, dilation=2),
@@ -257,7 +257,7 @@ class TransformerBlock(nn.Module):
 
 class Discriminator(BaseNetwork):
     def __init__(self, in_channels=3, use_sigmoid=False, use_spectral_norm=True, init_weights=True):
-        super(Discriminator, self).__init__()
+        super().__init__()
         self.use_sigmoid = use_sigmoid
         nf = 64
 

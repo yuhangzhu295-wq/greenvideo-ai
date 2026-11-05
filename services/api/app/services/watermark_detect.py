@@ -460,7 +460,11 @@ def detect_watermarks(
     if detections:
         for frame in frames:
             dev = np.abs(frame.astype(np.float32) - median.astype(np.float32)).mean(axis=2)
-            frame_static = _static_rank(dev)
+            # Rank staticness within the frame, then gate it on structure: a
+            # rank score always has ~30% of pixels above 0.7 even on a
+            # watermark-free or fully-moving frame, so the bare threshold
+            # keeps generating phantom masks on flat-but-calm patches.
+            frame_static = _static_rank(dev) * (structure > min_structure)
             fmask = np.zeros((h, w), dtype=np.uint8)
             for det in detections:
                 x, y, bw, bh = det.box
@@ -1112,26 +1116,77 @@ def _dense_ocr_sightings(
     first sighting and the tail after the last one would otherwise keep an
     uncaptured stretch of the watermark's path.
     """
+    # Budget guard: a 60s video at 0.35s intervals is ~170 OCR runs, each
+    # 1-3s in the worst case — the 600s subprocess timeout would blow. Widen
+    # the interval so the base scan stays within ~80 runs; refinement windows
+    # remain targeted and bounded.
+    max_dur = end_frame / fps
+    budget_runs = 80
+    if max_dur > 0 and max_dur / interval_s > budget_runs:
+        interval_s = max_dur / budget_runs
     sightings = _ocr_scan_window(video_path, end_frame, interval_s)
     if not sightings:
+        logger.warning("dense OCR base scan produced no sightings")
         return []
 
     times = sorted(float(s.get("time_s", 0.0)) for s in sightings)
-    max_dur = end_frame / fps
     fine = max(0.1, interval_s / 4.0)
     merged = list(sightings)
+    scans = 1
+
+    def _scan(start_f: int, end_f: int, interval: float) -> list[dict]:
+        nonlocal scans
+        scans += 1
+        return _ocr_scan_window(video_path, end_f, interval, start_frame=start_f)
 
     # Head gap: before the first sighting the watermark is already on screen.
     if times[0] > interval_s:
         head_end_f = min(end_frame, int((times[0] + interval_s) * fps))
-        head = _ocr_scan_window(video_path, head_end_f, fine, start_frame=0)
-        merged.extend(head)
+        merged.extend(_scan(0, head_end_f, fine))
 
     # Tail gap: the watermark keeps travelling after the last sighting.
     if max_dur - times[-1] > interval_s:
         tail_start_f = max(0, int((times[-1] - interval_s) * fps))
-        tail = _ocr_scan_window(video_path, end_frame, fine, start_frame=tail_start_f)
-        merged.extend(tail)
+        merged.extend(_scan(tail_start_f, end_frame, fine))
+
+    # Turning-point refinement: a direction reversal between two sightings
+    # (velocity flips sign while the endpoint positions barely move) hides the
+    # excursion entirely from endpoint interpolation — the chord midpoint sits
+    # up to the full excursion away from the true path. Re-scan those windows
+    # at a fine interval; cost is bounded to a handful of OCR runs per turn.
+    by_time: dict[float, dict] = {}
+    for s in merged:
+        t_s = round(float(s.get("time_s", 0.0)), 2)
+        by_time.setdefault(t_s, s)
+    ordered = [by_time[t] for t in sorted(by_time)]
+    if len(ordered) >= 3:
+        refine_windows: list[tuple[float, float]] = []
+        for i in range(1, len(ordered) - 1):
+            dt_in = ordered[i]["time_s"] - ordered[i - 1]["time_s"]
+            dt_out = ordered[i + 1]["time_s"] - ordered[i]["time_s"]
+            if dt_in <= 0 or dt_out <= 0 or dt_in + dt_out > 1.6:
+                continue
+            b_in = ordered[i - 1].get("tight_box") or ordered[i - 1]["box"]
+            b_mid = ordered[i].get("tight_box") or ordered[i]["box"]
+            b_out = ordered[i + 1].get("tight_box") or ordered[i + 1]["box"]
+            vx_in = (b_mid[0] - b_in[0]) / dt_in
+            vx_out = (b_out[0] - b_mid[0]) / dt_out
+            vy_in = (b_mid[1] - b_in[1]) / dt_in
+            vy_out = (b_out[1] - b_mid[1]) / dt_out
+            dv = max(abs(vx_out - vx_in), abs(vy_out - vy_in))
+            if dv > 300.0:
+                refine_windows.append(
+                    (ordered[i - 1]["time_s"], ordered[i + 1]["time_s"])
+                )
+        for win_start, win_end in refine_windows[:6]:
+            f_start = max(0, int(win_start * fps))
+            f_end = min(end_frame, int(win_end * fps))
+            if f_end - f_start >= 2:
+                merged.extend(_scan(f_start, f_end, max(0.08, fine / 2)))
+        logger.info(
+            "dense OCR re-scan: %d windows, %d sightings (video %.1fs)",
+            scans, len(merged), max_dur,
+        )
 
     # Deduplicate by (time, box).
     seen: set[tuple] = set()
@@ -1469,21 +1524,28 @@ def _sightings_to_moving_detections(
                         )
 
             for idx, (t_s, cx, cy) in enumerate(centres):
+                # Window boundaries are the midpoints to the neighbouring
+                # centres, WITHOUT the extra ±sub_step_s/2 extension: extended
+                # windows overlap by a full sub-step, so a fast watermark gets
+                # two stale inflated boxes OR'd on the same frame. Midpoint
+                # windows tile exactly — every frame belongs to one box.
                 seg_start = (
-                    t_s - sub_step_s
+                    max(0.0, t_s - sub_step_s / 2.0)
                     if idx == 0
-                    else (centres[idx - 1][0] + t_s) / 2.0 - sub_step_s / 2.0
+                    else (centres[idx - 1][0] + t_s) / 2.0
                 )
                 seg_end = (
-                    t_s + sub_step_s
+                    min(max_dur, t_s + sub_step_s / 2.0)
                     if idx == len(centres) - 1
-                    else (t_s + centres[idx + 1][0]) / 2.0 + sub_step_s / 2.0
+                    else (t_s + centres[idx + 1][0]) / 2.0
                 )
                 # A fixed-size box pinned to the centre-time position goes
                 # stale across its own time window: at ~890 px/s a ±0.16s
                 # window sweeps ±145 px. Grow the box by the text's local
                 # travel during exactly this window so it always covers the
-                # watermark it claims to cover, and nothing further.
+                # watermark it claims to cover. The second difference of the
+                # positions (local curvature, ~a·Δt²) is added on top: a
+                # chord-centred box under-covers a curved path by that amount.
                 win_w = max(0.0, seg_end - seg_start)
                 if 0 < idx < len(centres) - 1 and centres[idx + 1][0] > centres[idx - 1][0]:
                     vx = (centres[idx + 1][1] - centres[idx - 1][1]) / (
@@ -1492,10 +1554,17 @@ def _sightings_to_moving_detections(
                     vy = (centres[idx + 1][2] - centres[idx - 1][2]) / (
                         centres[idx + 1][0] - centres[idx - 1][0]
                     )
+                    curv_x = abs(
+                        centres[idx + 1][1] - 2.0 * cx + centres[idx - 1][1]
+                    )
+                    curv_y = abs(
+                        centres[idx + 1][2] - 2.0 * cy + centres[idx - 1][2]
+                    )
                 else:
                     vx = vy = 0.0
-                cw = mw + abs(vx) * win_w
-                chh = mh + abs(vy) * win_w
+                    curv_x = curv_y = 0.0
+                cw = mw + abs(vx) * win_w + 0.5 * curv_x
+                chh = mh + abs(vy) * win_w + 0.5 * curv_y
                 ux = int(round(cx - cw / 2.0))
                 uy = int(round(cy - chh / 2.0))
                 # Extrapolated centres can fall outside the frame (phantom
@@ -1564,6 +1633,8 @@ def frame_prompts_at(
     frame_idx: int,
     fps: float,
     total_frames: int,
+    width: int = 0,
+    height: int = 0,
     max_prompts: int = 3,
 ) -> list[list[int]]:
     """Select the SAM2 prompt boxes for one frame from timed detections.
@@ -1573,7 +1644,11 @@ def frame_prompts_at(
     detection covers the same frame, the interpolated box is dropped because
     the OR of a tight box and its inflated interpolations is exactly the
     over-segmentation that destroyed background in the P0 incident. Boxes are
-    clamped to the frame and capped at ``max_prompts`` by score.
+    clamped to the real frame bounds and capped at ``max_prompts`` by score.
+
+    Coverage is HALF-OPEN (``start_s <= t < end_s``): on a corner hop the
+    boundary time belongs to the new position only, so the previous corner's
+    box can never join the OR.
     """
     if fps <= 0:
         return []
@@ -1582,15 +1657,20 @@ def frame_prompts_at(
     covering = [
         d
         for d in detections
-        if (d.start_s or 0.0) <= t <= (d.end_s if d.end_s is not None else max_dur)
+        if (d.start_s or 0.0) <= t < (d.end_s if d.end_s is not None else max_dur)
     ]
     if not covering:
         return []
 
-    # Frame bounds come from the largest detection extent; the SAM worker
-    # clamps again internally, but prompt geometry should already be sane.
-    frame_w = max((d.box[0] + d.box[2] for d in detections), default=0)
-    frame_h = max((d.box[1] + d.box[3] for d in detections), default=0)
+    # Frame bounds must come from the real picture, not from the detections'
+    # own extent — an out-of-bounds detection would otherwise become its own
+    # clamp ceiling and survive truncation.
+    frame_w = int(width) if width and width > 0 else max(
+        (d.box[0] + d.box[2] for d in detections), default=0
+    )
+    frame_h = int(height) if height and height > 0 else max(
+        (d.box[1] + d.box[3] for d in detections), default=0
+    )
 
     def _clamp(det: Detection) -> tuple[int, int, int, int]:
         x, y, w, h = det.box
@@ -1814,6 +1894,7 @@ def detect_timed_watermarks_hybrid(video_path: Path | str) -> DetectionResult:
     ocr_cli = api_dir.parent / "ai-worker" / "ocr_detector_cli.py"
 
     ocr_boxes: list[dict] = []
+    ocr_unconfirmed_global: list[dict] = []
     if ai_worker_python.exists() and ocr_cli.exists() and not vlm_detections:
         try:
             cmd = [
@@ -1832,6 +1913,28 @@ def detect_timed_watermarks_hybrid(video_path: Path | str) -> DetectionResult:
                 if line.startswith("OUTPUT_JSON:"):
                     ocr_boxes = json.loads(line.removeprefix("OUTPUT_JSON:"))
                     break
+            # The CLI never silently drops a candidate: single-sighting text
+            # without a platform prior arrives as UNCONFIRMED_JSON on stderr.
+            # Collect it and persist it on the result so the API layer can
+            # route it to user confirmation (goal task 12) instead of having
+            # the evidence die in a log line.
+            unconfirmed_candidates: list[dict] = []
+            stderr = proc.stderr.decode("utf-8", errors="replace")
+            for line in stderr.splitlines():
+                if not line.startswith("UNCONFIRMED_JSON:"):
+                    continue
+                try:
+                    batch = json.loads(line.removeprefix("UNCONFIRMED_JSON:"))
+                except Exception:
+                    continue
+                if isinstance(batch, list):
+                    unconfirmed_candidates.extend(batch)
+            if unconfirmed_candidates:
+                logger.warning(
+                    "OCR 检出 %d 个低置信候选（单次出现，需用户确认）",
+                    len(unconfirmed_candidates),
+                )
+                ocr_unconfirmed_global.extend(unconfirmed_candidates)
         except Exception as exc:
             logger.warning("OCR detector CLI failed or timed out: %s", exc)
             ocr_boxes = []
@@ -1932,9 +2035,14 @@ def detect_timed_watermarks_hybrid(video_path: Path | str) -> DetectionResult:
                 continue
 
             for start_s, end_s in intervals:
+                # The tight OCR box is what SAM2 should be prompted with; the
+                # padded box (avatar expansion, edge snapping) stays available
+                # as search context. Measured: tight prompts raise mask
+                # precision 0.52→0.63 (grass), 0.47→0.56 (sky).
+                tb = b.get("tight_box") or (bx, by, bw, bh)
                 det = Detection(
-                    box=(bx, by, bw, bh),
-                    area=bw * bh,
+                    box=(int(tb[0]), int(tb[1]), int(tb[2]), int(tb[3])),
+                    area=int(tb[2]) * int(tb[3]),
                     score=float(b.get("confidence", 0.95)),
                     kind="text",
                     start_s=start_s,
@@ -1954,6 +2062,8 @@ def detect_timed_watermarks_hybrid(video_path: Path | str) -> DetectionResult:
             "outro_cut_frame": outro_cut_frame,
             "content_frames": content_end_frame,
             "detections_count": len(detections),
+            "unconfirmed_candidates": ocr_unconfirmed_global[:20],
+            "unconfirmed_count": len(ocr_unconfirmed_global),
         }
         return DetectionResult(
             ok=True,

@@ -62,13 +62,19 @@ class VLMVideoAnalysisResult(BaseModel):
     reason: str | None = None
 
 
+_DISABLED_API_KEYS: set[str] = set()
+
+
 def is_vlm_available() -> bool:
-    """Check whether Gemini or compatible VLM API key is configured."""
-    return bool(
+    """Check whether Gemini or compatible VLM API key is configured and functional."""
+    key = (
         os.getenv("GEMINI_API_KEY")
         or os.getenv("VLM_API_KEY")
         or os.getenv("OPENAI_API_KEY")
     )
+    if not key or key in _DISABLED_API_KEYS:
+        return False
+    return True
 
 
 def sample_keyframes_for_vlm(
@@ -281,6 +287,9 @@ def call_openai_compatible_grounding(
                 logger.warning(
                     "OpenAI VLM API error %d: %s", resp.status_code, resp.text[:200]
                 )
+                if resp.status_code in (401, 403):
+                    _DISABLED_API_KEYS.add(api_key)
+                    logger.warning("VLM API key 认证失败，禁用该 key 自动回退本地 OCR")
                 return VLMVideoAnalysisResult(
                     ok=False, reason=f"OPENAI_API_ERROR_{resp.status_code}"
                 )
@@ -325,6 +334,8 @@ def call_openai_compatible_grounding(
             )
     except Exception as exc:
         logger.warning("OpenAI grounding exception: %s", exc)
+        _DISABLED_API_KEYS.add(api_key)
+        logger.warning("VLM 网络连接失败，禁用该 key 自动回退本地 OCR")
         return VLMVideoAnalysisResult(ok=False, reason=f"EXCEPTION_{exc}")
 
 

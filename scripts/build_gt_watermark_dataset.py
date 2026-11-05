@@ -77,6 +77,9 @@ def _draw_watermark(
     font_scale: float,
 ) -> np.ndarray:
     """Draw watermark onto frame and update GT alpha mask."""
+    if alpha < 0.05:
+        # Invisible watermark: no visual presence, GT mask stays empty.
+        return frame
     overlay = frame.copy()
     cv2.putText(overlay, text, pos, cv2.FONT_HERSHEY_SIMPLEX, font_scale, colour, 3, cv2.LINE_AA)
     cv2.putText(wm_mask, text, pos, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 255, 3, cv2.LINE_AA)
@@ -114,6 +117,7 @@ def generate_video(
     fps: float,
     dur_s: float,
     seed: int,
+    font_scale: float = 1.2,
 ) -> dict:
     """Generate one GT video + per-frame masks + metadata."""
     rng = np.random.RandomState(seed)
@@ -145,7 +149,7 @@ def generate_video(
             else:
                 a = alpha * min(1.0, (1 - phase) * 2)
 
-        bg = _draw_watermark(bg, wm_mask, text, pos, colour, a, 1.2)
+        bg = _draw_watermark(bg, wm_mask, text, pos, colour, a, font_scale)
         cv2.imwrite(str(frames_dir / f"{i:06d}.png"), bg)
         cv2.imwrite(str(masks_dir / f"{i:06d}.png"), wm_mask)
 
@@ -155,6 +159,7 @@ def generate_video(
         "text": text,
         "colour": list(colour),
         "alpha": alpha,
+        "font_scale": font_scale,
         "width": w,
         "height": h,
         "fps": fps,
@@ -175,6 +180,10 @@ def generate_video(
 
     return meta
 
+
+# Dataset version: bumped when the generator semantics change, so gate
+# reports can bind their evidence to a known input state.
+DATASET_VERSION = "2026-11-05-noise-fix-1"
 
 SCENES = ["grass", "sky", "night", "building", "water", "face", "camera_motion"]
 TRAJECTORIES = ["fixed_tl", "fixed_br", "corner_hop", "continuous_drift", "fade_in_out"]
@@ -212,9 +221,10 @@ def main():
         print(f"[{i+1}/{args.count}] {scene}/{traj} '{text}' alpha={alpha}")
 
     (output_dir / "index.json").write_text(
-        json.dumps(all_meta, indent=2), encoding="utf-8"
+        json.dumps({"dataset_version": DATASET_VERSION, "videos": all_meta}, indent=2),
+        encoding="utf-8",
     )
-    print(f"\nGenerated {args.count} videos in {output_dir}")
+    print(f"\nGenerated {args.count} videos in {output_dir} (version {DATASET_VERSION})")
 
 
 if __name__ == "__main__":
