@@ -732,3 +732,9 @@ OCR 路线（paddlepaddle 3.2.2 + PaddleOCR 3.7.0 CPU）实测可用但 11 秒/�
 4. **真随机盲测集（`artifacts/blind-set`，SEED=202611）**：
    - **单帧门禁：12/12 PASS**（全部有效含水印期采样，且全透明帧 0 假阳性掩码，全通过）
    - **时序一致性门禁：6/6 PASS**（全通过）
+
+### Reviewer 审查结论
+
+- **code-reviewer**：**PASS / APPROVED**（在提交 `246eb22` 审查中确认所有 P0/P1 问题均已闭环，代码质量与视觉质量达标，唯一 P2 优化建议已在 `35d0330` 闭环）
+- **architecture-reviewer**：终审中（基于提交 `35d0330`）
+
