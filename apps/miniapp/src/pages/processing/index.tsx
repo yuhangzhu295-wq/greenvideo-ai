@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { Button, Image, Text, View, Video } from "@tarojs/components";
 import Taro from "@tarojs/taro";
-import { cancelTask, getTask, toAbsoluteUrl } from "@/api/client";
+import { cancelTask, confirmTask, getTask, toAbsoluteUrl } from "@/api/client";
 import type { TaskStatus } from "@/api/types";
 import { BrandHeader, Card, IconBadge, PageShell, ProgressRing, SectionTitle, navigate } from "@/components";
 
@@ -152,6 +152,28 @@ export default function ProcessingPage() {
     navigate("/pages/history/index?type=processing");
   }
 
+  async function handleConfirmWatermark() {
+    if (!task.task_id) return;
+    try {
+      const updated = await confirmTask(task.task_id, { action: "confirm" });
+      setTask(updated);
+      Taro.showToast({ title: "已确认，继续修复", icon: "success" });
+    } catch {
+      Taro.showToast({ title: "确认失败", icon: "none" });
+    }
+  }
+
+  async function handleRejectConfirmation() {
+    if (!task.task_id) return;
+    try {
+      const updated = await confirmTask(task.task_id, { action: "reject" });
+      setTask(updated);
+      Taro.showToast({ title: "已跳过候选区域", icon: "none" });
+    } catch {
+      Taro.showToast({ title: "操作失败", icon: "none" });
+    }
+  }
+
   const progressLabel = task.status === "failed" ? "失败" : isDone(task) ? "已完成" : "处理中...";
 
   return (
@@ -232,7 +254,7 @@ export default function ProcessingPage() {
                 ? "✓ 文件下载完成"
                 : task.media_type === "audio"
                 ? "✓ 音频提取完成"
-                : "✓ AI 无损修复完成 · 纯净无损"}
+                : "✓ AI 像素级去水印完成"}
             </View>
           </View>
         ) : (
@@ -267,6 +289,23 @@ export default function ProcessingPage() {
           </View>
         </View>
 
+        {task.status === "waiting_confirmation" && (
+          <View style={{ marginTop: "12px", padding: "12px", borderRadius: "8px", border: "1px solid #f59e0b", background: "#fffbeb" }}>
+            <View style={{ fontWeight: "bold", color: "#b45309", marginBottom: "6px", fontSize: "14px" }}>
+              ⚠️ 发现疑似水印候选（单次出现，需确认）
+            </View>
+            <View style={{ fontSize: "12px", color: "#4b5563", marginBottom: "8px" }}>
+              {task.unconfirmed_candidates && task.unconfirmed_candidates.length > 0
+                ? task.unconfirmed_candidates.map((c, i) => (
+                    <View key={i} style={{ marginBottom: "3px" }}>
+                      • {c.text ? `文字: "${c.text}"` : "图形标记"} (时间: {c.time_s}s, 置信度: {Math.round(c.score * 100)}%)
+                    </View>
+                  ))
+                : "检测到低置信度候选区域，请确认是否执行消除。"}
+            </View>
+          </View>
+        )}
+
         {error && (
           <View className='error-box'>
             <Text>{error}</Text>
@@ -293,6 +332,15 @@ export default function ProcessingPage() {
           </Button>
           <Button className='secondary-btn' onClick={() => navigate("/pages/history/index")}>
             查看历史
+          </Button>
+        </View>
+      ) : task.status === "waiting_confirmation" ? (
+        <View className='button-row'>
+          <Button className='primary-btn' onClick={handleConfirmWatermark}>
+            确认去除水印
+          </Button>
+          <Button className='secondary-btn' onClick={handleRejectConfirmation}>
+            忽略/跳过
           </Button>
         </View>
       ) : task.status === "failed" ? (

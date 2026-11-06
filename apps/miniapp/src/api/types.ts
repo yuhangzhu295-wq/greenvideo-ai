@@ -66,7 +66,29 @@ export interface TaskStatus {
   }> | null;
   video_width?: number | null;
   video_height?: number | null;
+  unconfirmed_candidates?: Array<{
+    box: [number, number, number, number];
+    tight_box?: [number, number, number, number];
+    text: string;
+    score: number;
+    time_s: number;
+    reason?: string;
+  }> | null;
+  requires_confirmation?: boolean;
   error?: string | null;
+}
+
+export interface MaskRegion {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface TaskConfirmPayload {
+  action?: "confirm" | "reject" | "manual";
+  confirmed_indices?: number[];
+  custom_regions?: MaskRegion[];
 }
 
 export interface HistoryItem {

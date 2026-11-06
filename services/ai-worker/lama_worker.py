@@ -21,6 +21,14 @@ def main() -> int:
     import cv2
     import numpy as np
     import torch
+
+    # Disable TorchScript profiling executor on Windows CUDA to prevent intermittent
+    # nvrtc runtime compilation failures when JIT-fusing batch norm operations.
+    if hasattr(torch._C, "_jit_set_profiling_executor"):
+        torch._C._jit_set_profiling_executor(False)
+    if hasattr(torch._C, "_jit_set_profiling_mode"):
+        torch._C._jit_set_profiling_mode(False)
+
     from iopaint.model.lama import LaMa
     from iopaint.schema import HDStrategy, InpaintRequest
 

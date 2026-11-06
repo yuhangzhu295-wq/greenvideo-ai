@@ -59,14 +59,17 @@ class PixelMaskProvider:
         self.used_fallback = False
         self.worker = Sam2Worker()
         self.tracks = TrackManager()
-        # prompts: {frame_idx: [{"box": [x,y,w,h]}, ...]} — multiple per frame
+        # prompts: {frame_idx: [{"box": [x,y,w,h], "end_frame": ...}, ...]} — multiple per frame
         self._prompts: dict[int, list[dict]] = {}
         for f_idx, plist in (prompts or {}).items():
             entries = []
             for p in plist:
                 box = p.get("box")
                 if box:
-                    entries.append({"box": [box[0], box[1], box[0] + box[2], box[1] + box[3]]})
+                    entries.append({
+                        "box": [box[0], box[1], box[0] + box[2], box[1] + box[3]],
+                        "end_frame": p.get("end_frame", self.end_frame),
+                    })
             if entries:
                 self._prompts[int(f_idx)] = entries
 
@@ -127,7 +130,10 @@ class PixelMaskProvider:
                 self._save_debug(kf, frame, boxes_used, combined_mask)
                 # Pass ALL boxes for this keyframe to video propagation so
                 # SAM2 can track each watermark instance independently.
-                keyframe_prompts[kf] = [{"box": p["box"]} for p in plist]
+                keyframe_prompts[kf] = [
+                    {"box": p["box"], "end_frame": p.get("end_frame", self.end_frame)}
+                    for p in plist
+                ]
 
             # Phase 2: Propagate masks in chunks with cancel checks between
             # windows. Chunking bounds GPU memory per call and allows the
@@ -143,7 +149,7 @@ class PixelMaskProvider:
                 # Tracks the last propagated mask; a chunk without its own
                 # keyframe re-seeds from it, otherwise a 120-frame video with
                 # a single frame-0 seed would leave frames 60+ unmasked.
-                carry_boxes: list[list[int]] = []
+                carry_boxes: list[dict] = []
                 while start < prop_end:
                     if self._cancel_check and self._cancel_check():
                         raise RuntimeError("SAM2 传播已被用户取消")
@@ -154,9 +160,16 @@ class PixelMaskProvider:
                         for k, v in keyframe_prompts.items()
                         if start <= k < end
                     }
-                    if carry_boxes:
+                    active_carries = [
+                        b for b in carry_boxes
+                        if b.get("end_frame") is None or start < b["end_frame"]
+                    ]
+                    if active_carries:
                         chunk_prompts.setdefault(start, []).extend(
-                            [{"box": b} for b in carry_boxes]
+                            [
+                                {"box": b["box"], "end_frame": b.get("end_frame")}
+                                for b in active_carries
+                            ]
                         )
                     if chunk_prompts:
                         prop_result = self.worker.propagate_video(
@@ -184,9 +197,24 @@ class PixelMaskProvider:
                             and (last_mask > 0).any()
                         ):
                             ys, xs = np.where(last_mask > 0)
-                            carry_boxes = [
-                                [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
-                            ]
+                            max_end = max(
+                                (
+                                    p.get("end_frame", prop_end)
+                                    for plist in chunk_prompts.values()
+                                    for p in plist
+                                ),
+                                default=prop_end,
+                            )
+                            if end < max_end:
+                                b_rect = [
+                                    int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+                                ]
+                                carry_boxes = [
+                                    {
+                                        "box": b_rect,
+                                        "end_frame": max_end,
+                                    }
+                                ]
                     start = end
         finally:
             self.worker.stop()

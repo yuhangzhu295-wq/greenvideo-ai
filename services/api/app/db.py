@@ -179,13 +179,14 @@ def get_parse_result(parse_id: str) -> ParseResult | None:
 
 def insert_task(row: dict) -> None:
     now = utc_now()
+    raw_input = row.get("input_json") if "input_json" in row else json.dumps(row.get("input", {}), ensure_ascii=False)
     task = Task(
         id=row["id"],
         type=row["type"],
         status=row["status"],
         progress=row["progress"],
         stage=row["stage"],
-        input_json=json.dumps(row.get("input", {}), ensure_ascii=False),
+        input_json=raw_input,
         output_path=row.get("output_path"),
         error=row.get("error"),
         created_at=now,

@@ -25,6 +25,7 @@ from app.db import (
 from app.schemas import (
     DownloadTaskRequest,
     MaskRegion,
+    TaskConfirmPayload,
     TaskCreateResponse,
     TaskStatusDTO,
     TimedMaskRegion,
@@ -524,7 +525,28 @@ async def _run_watermark_task_locked(
             _safe_stage(task_id, 12, "正在检测水印区域与片尾")
             frame_width, frame_height = _probe_frame_size(source_path)
             detection = await asyncio.to_thread(_detect_source_watermark, source_path)
+            unconfirmed = (
+                detection.stats.get("unconfirmed_candidates")
+                if hasattr(detection, "stats") and detection.stats
+                else []
+            )
             if not detection.ok:
+                if unconfirmed:
+                    update_task(
+                        task_id,
+                        status="waiting_confirmation",
+                        progress=16,
+                        stage="发现潜在水印，等待用户确认",
+                        input={
+                            **payload.model_dump(),
+                            "source_path": str(source_path) if source_path else None,
+                            "video_width": frame_width,
+                            "video_height": frame_height,
+                            "unconfirmed_candidates": unconfirmed,
+                            "requires_confirmation": True,
+                        },
+                    )
+                    return
                 update_task(
                     task_id,
                     status="failed",
@@ -560,6 +582,22 @@ async def _run_watermark_task_locked(
                 ]
 
             if not effective_timed_regions and not mask_regions:
+                if unconfirmed:
+                    update_task(
+                        task_id,
+                        status="waiting_confirmation",
+                        progress=16,
+                        stage="发现潜在水印，等待用户确认",
+                        input={
+                            **payload.model_dump(),
+                            "source_path": str(source_path) if source_path else None,
+                            "video_width": frame_width,
+                            "video_height": frame_height,
+                            "unconfirmed_candidates": unconfirmed,
+                            "requires_confirmation": True,
+                        },
+                    )
+                    return
                 update_task(
                     task_id,
                     status="failed",
@@ -769,8 +807,16 @@ async def _run_watermark_task_locked(
                         )
                         for xyxy in boxes:
                             x1, y1, x2, y2 = xyxy
+                            end_f = probe_total
+                            for det in detection.detections:
+                                if det.start_s is None:
+                                    continue
+                                det_f0 = math.ceil(det.start_s * probe_fps - 1e-6)
+                                if abs(det_f0 - f0) <= 1 and det.end_s is not None:
+                                    end_f = int(det.end_s * probe_fps)
+                                    break
                             pixel_mask_prompts.setdefault(f0, []).append(
-                                {"box": [x1, y1, x2 - x1, y2 - y1]}
+                                {"box": [x1, y1, x2 - x1, y2 - y1], "end_frame": end_f}
                             )
                 except Exception as exc:
                     # Prompt-build failure must be visible, never silent: the
@@ -1050,6 +1096,103 @@ def get_task_status(task_id: str) -> TaskStatusDTO:
         requires_confirmation=bool(task_input.get("requires_confirmation", False)),
         error=task.error,
     )
+
+
+@router.post("/{task_id}/confirm", response_model=TaskStatusDTO)
+async def confirm_task(
+    task_id: str,
+    payload: TaskConfirmPayload,
+    background_tasks: BackgroundTasks,
+) -> TaskStatusDTO:
+    task = get_task(task_id)
+    if task is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "NOT_FOUND", "message": "任务不存在。"},
+        )
+    if task.status != "waiting_confirmation":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "INVALID_STATE",
+                "message": f"任务当前状态为 {task.status}，无需确认。",
+            },
+        )
+    try:
+        task_input = json.loads(task.input_json or "{}")
+    except Exception:
+        task_input = {}
+
+    source_path_str = task_input.get("source_path")
+    source_path = Path(source_path_str) if source_path_str else None
+
+    if payload.action == "reject":
+        update_task(task_id, status="canceled", stage="用户已跳过水印确认")
+        update_history_by_task(task_id, status="failed")
+        return get_task_status(task_id)
+
+    if payload.action == "manual":
+        new_payload = WatermarkTaskRequest(
+            video_url=task_input.get("video_url"),
+            repair_mode=task_input.get("repair_mode", "ai"),
+            auto_detect=False,
+            mask_preset="custom",
+            mask_regions=payload.custom_regions or [],
+            timed_mask_regions=payload.timed_mask_regions or [],
+        )
+    else:  # confirm
+        candidates = task_input.get("unconfirmed_candidates") or []
+        indices = (
+            payload.confirmed_indices
+            if payload.confirmed_indices is not None
+            else list(range(len(candidates)))
+        )
+        selected = [candidates[i] for i in indices if 0 <= i < len(candidates)]
+        if not selected and not payload.custom_regions and not payload.timed_mask_regions:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "EMPTY_CONFIRMATION", "message": "没有选中的水印候选区域。"},
+            )
+        timed_regions = []
+        for c in selected:
+            box = c.get("tight_box") or c.get("box")
+            if box and len(box) == 4:
+                t = float(c.get("time_s", 0.0))
+                timed_regions.append(
+                    TimedMaskRegion(
+                        x=int(box[0]),
+                        y=int(box[1]),
+                        w=int(box[2]),
+                        h=int(box[3]),
+                        start_s=max(0.0, t - 0.5),
+                        end_s=t + 1.5,
+                    )
+                )
+        new_payload = WatermarkTaskRequest(
+            video_url=task_input.get("video_url"),
+            repair_mode=task_input.get("repair_mode", "ai"),
+            auto_detect=False,
+            mask_preset="custom",
+            timed_mask_regions=timed_regions,
+        )
+
+    update_task(
+        task_id,
+        status="processing",
+        progress=18,
+        stage="用户已确认水印区域，开始修复",
+        input={
+            **task_input,
+            "requires_confirmation": False,
+        },
+    )
+    background_tasks.add_task(
+        _run_watermark_task,
+        task_id,
+        new_payload,
+        source_path,
+    )
+    return get_task_status(task_id)
 
 
 @router.post("/{task_id}/cancel")

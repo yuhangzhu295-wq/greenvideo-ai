@@ -5,6 +5,7 @@ import type {
   HealthStatus,
   HistoryItem,
   ParseResult,
+  TaskConfirmPayload,
   TaskStatus,
   WatermarkPayload
 } from "./types";
@@ -170,6 +171,13 @@ export async function getTask(taskId: string): Promise<TaskStatus> {
 
 export async function cancelTask(taskId: string): Promise<{ ok: boolean }> {
   return request<{ ok: boolean }>(`/api/tasks/${taskId}/cancel`, { method: "POST" });
+}
+
+export async function confirmTask(taskId: string, payload: TaskConfirmPayload = {}): Promise<TaskStatus> {
+  return request<TaskStatus>(`/api/tasks/${taskId}/confirm`, {
+    method: "POST",
+    data: payload
+  });
 }
 
 export async function deleteTask(taskId: string): Promise<{ ok: boolean }> {

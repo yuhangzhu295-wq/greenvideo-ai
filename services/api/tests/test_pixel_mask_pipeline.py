@@ -158,3 +158,41 @@ def test_pixel_mask_provider_carries_boxes_across_chunks(monkeypatch):
     carried_box = chunk_calls[1]["prompts"][60][0]["box"]
     assert carried_box[0] == 20 or carried_box[0] <= 20
 
+
+def test_pixel_mask_provider_drops_expired_target_and_picks_up_new_target(monkeypatch):
+    from unittest.mock import MagicMock
+    from app.services.watermark_detection.pixel_mask_provider import PixelMaskProvider
+
+    mock_worker = MagicMock()
+    dummy_mask = np.zeros((100, 100), dtype=np.uint8)
+    dummy_mask[10:30, 20:50] = 255
+    mock_worker.segment_frame.return_value = {"mask": dummy_mask, "area": 600}
+
+    chunk_calls = []
+
+    def mock_propagate(video_path, prompts, frame_indices):
+        chunk_calls.append({"prompts": prompts, "indices": frame_indices})
+        return {str(idx): {"mask": dummy_mask, "area": 600} for idx in frame_indices}
+
+    mock_worker.propagate_video.side_effect = mock_propagate
+    target = "app.services.watermark_detection.pixel_mask_provider.Sam2Worker"
+    monkeypatch.setattr(target, lambda: mock_worker)
+
+    # Target A starts at 0, ends at 40 (inside Chunk 1).
+    # Target B starts at 75, ends at 120 (inside Chunk 2).
+    prompts = {
+        0: [{"box": [20, 10, 30, 20], "end_frame": 40}],
+        75: [{"box": [50, 50, 20, 20], "end_frame": 120}],
+    }
+    provider = PixelMaskProvider("dummy.mp4", 100, 100, prompts=prompts, total_frames=120)
+    provider.build_tracks(lambda idx: np.zeros((100, 100, 3), dtype=np.uint8))
+
+    assert len(chunk_calls) == 2
+    # Chunk 1 starts at 0 with target A
+    assert 0 in chunk_calls[0]["prompts"]
+    # Chunk 2 should NOT carry target A at frame 60 because end_frame was 40 < 60!
+    assert 60 not in chunk_calls[1]["prompts"], "expired target A must not be carried"
+    # Chunk 2 should have target B at frame 75
+    assert 75 in chunk_calls[1]["prompts"]
+
+

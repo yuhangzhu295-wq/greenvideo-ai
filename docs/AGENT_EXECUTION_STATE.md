@@ -735,6 +735,36 @@ OCR 路线（paddlepaddle 3.2.2 + PaddleOCR 3.7.0 CPU）实测可用但 11 秒/�
 
 ### Reviewer 审查结论
 
-- **code-reviewer**：**PASS / APPROVED**（在提交 `246eb22` 审查中确认所有 P0/P1 问题均已闭环，代码质量与视觉质量达标，唯一 P2 优化建议已在 `35d0330` 闭环）
-- **architecture-reviewer**：终审中（基于提交 `35d0330`）
+- **code-reviewer**：**PASS / APPROVED**（在提交 `246eb22` 审查中确认所有 P0/P1 问题均已闭环，代码质量与视觉质量达标，P2 建议均已闭环）
+- **architecture-reviewer**：在 `35d0330` 评审中指出候选确认闭环（P0）与低对比度增益漏洞（P0），均已在 Round 12 彻底修复。
+
+## Round 12 — 候选确认端到端闭环与低对比度增益防漏洞（2026-11-06）
+
+### 变更内容
+1. **[P0 (arch)] 候选确认端到端状态与接口打通**：
+   - 增加任务状态 `"waiting_confirmation"`，当自动检测无高置信度结果但存在低置信候选时，任务进入等待确认状态并保留候选数据。
+   - 新增接口 `POST /api/tasks/{task_id}/confirm`（支持确认、忽略、手动覆盖三种操作模式）。
+   - 前端小程序（`apps/miniapp/`）更新 `TaskStatus` 类型，`client.ts` 增加 `confirmTask`，页面增加候选确认卡片与“确认去除/忽略”操作栏。
+   - 页面状态文案从“AI 无损修复完成 · 纯净无损”改为事实性表述“AI 像素级去水印完成”。
+   - 增加全套单元测试 `services/api/tests/test_task_confirmation.py`（4 项测试覆盖确认、忽略、无效状态和手动覆盖）。
+
+2. **[P0 (arch)] 质量门禁真实去除增益漏洞修复**：
+   - `scripts/run_e2e_gate.py` 修复了当源水印区域未被修复（原样返回）时因绝对 PSNR 满足而虚假通过的漏洞。
+   - 增加未修改防护断言：`changed_inside_ratio < 0.5` 强制 FAIL（未改变的源帧绝对无法通过）。
+   - 始终输出真实的数学增益 `removal_gain = 1.0 - rep_mae / src_mae`，杜绝任何假赋值为 1.0。
+   - 低对比度水印（`src_mae < 20.0`）要求实际重写面积率 ≥ 80% 且绝对 PSNR ≥ 20dB。
+
+3. **[P1 (arch)] 目标生命周期管理与跨块终止**：
+   - `PixelMaskProvider` 与 `tasks.py` 支持按提示词携带 `end_frame`。
+   - 跨块传播时对已结束目标停止 `carry_boxes`，防止水印在视频后段死灰复燃。
+   - 增加单元测试 `test_pixel_mask_provider_drops_expired_target_and_picks_up_new_target`。
+
+4. **[稳定性] Windows PyTorch NVRTC JIT 异常防护**：
+   - `lama_worker.py` 显式禁用 `_jit_set_profiling_executor` 与 `_jit_set_profiling_mode`，防止 Windows 环境下 NVRTC 批归一化核函数动态编译失败。
+   - `run_e2e_gate.py` 改用 `_inpaint_frame` ROI 局部裁切，避免 720p 全帧送入 LaMa 导致显存溢出。
+
+### 验证数据
+- **单元测试**：**98 passed, 0 failed**
+- **代码风格**：Ruff check **All checks passed!**
+- **小程序类型检查**：`npm run typecheck` **0 errors**
 

@@ -98,6 +98,13 @@ class WatermarkTaskRequest(BaseModel):
         return self
 
 
+class TaskConfirmPayload(BaseModel):
+    action: Literal["confirm", "reject", "manual"] = "confirm"
+    confirmed_indices: list[int] | None = None
+    custom_regions: list[MaskRegion] | None = None
+    timed_mask_regions: list[TimedMaskRegion] | None = None
+
+
 class TaskCreateResponse(BaseModel):
     task_id: str
     status: str

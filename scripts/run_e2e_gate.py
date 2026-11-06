@@ -84,7 +84,7 @@ def run_e2e_gate(dataset_dir: str | Path, sample_frames: int = 2) -> dict:
             detections = det.detections if det.ok and det.detections else []
 
             # One LaMa worker per video (loading per frame is pure overhead).
-            from app.services.video_repair import LamaWorker
+            from app.services.video_repair import LamaWorker, _inpaint_frame
 
             lama = LamaWorker()
             lama.start()
@@ -118,8 +118,8 @@ def run_e2e_gate(dataset_dir: str | Path, sample_frames: int = 2) -> dict:
                             combined = np.maximum(combined, m)
                         sam2_mask = combined
 
-                    # Step 3: Run LaMa repair with SAM2 pixel mask
-                    repaired = lama.inpaint(frame_with_wm, sam2_mask)
+                    # Step 3: Run LaMa repair with SAM2 pixel mask (ROI-cropped)
+                    repaired = _inpaint_frame(frame_with_wm, sam2_mask, worker=lama)
 
                     # Step 4: Evaluate vs clean frame
                     m = evaluate_mask(sam2_mask, gt)
@@ -140,6 +140,8 @@ def run_e2e_gate(dataset_dir: str | Path, sample_frames: int = 2) -> dict:
                     # unchanged would pass every outside-mask check.
                     inside = gt > 0
                     has_gt = inside.any()
+                    edge_reduction = 0.0
+                    changed_inside_ratio = 0.0
                     if has_gt:
                         src_mae = float(
                             np.abs(clean.astype(float) - frame_with_wm.astype(float))
@@ -149,16 +151,41 @@ def run_e2e_gate(dataset_dir: str | Path, sample_frames: int = 2) -> dict:
                             np.abs(clean.astype(float) - repaired.astype(float))
                             .mean(axis=2)[inside].mean()
                         )
-                        if src_mae < 20.0:
-                            # Low-contrast watermark (contrast comparable to noise):
-                            # pass if repair matches clean ground truth at acceptable PSNR (>=20dB).
-                            removal_gain = (
-                                1.0
-                                if (rep_mae <= src_mae + 2.0 and q["inside_psnr"] >= 20.0)
-                                else (1.0 - rep_mae / src_mae)
-                            )
+                        actual_gain = 1.0 - rep_mae / max(src_mae, 1e-6)
+                        removal_gain = round(actual_gain, 3)
+
+                        diff_inside = (
+                            np.abs(frame_with_wm.astype(int) - repaired.astype(int))
+                            .max(axis=2)[inside]
+                        )
+                        changed_inside = int((diff_inside > 0).sum())
+                        changed_inside_ratio = changed_inside / max(1, inside.sum())
+
+                        # Edge reduction inside watermark: measure text edge attenuation
+                        gray_fr = cv2.cvtColor(frame_with_wm, cv2.COLOR_BGR2GRAY)
+                        gray_rep = cv2.cvtColor(repaired, cv2.COLOR_BGR2GRAY)
+                        sobel_fr = float(
+                            np.abs(cv2.Sobel(gray_fr, cv2.CV_32F, 1, 1))[inside].mean()
+                        )
+                        sobel_rep = float(
+                            np.abs(cv2.Sobel(gray_rep, cv2.CV_32F, 1, 1))[inside].mean()
+                        )
+                        edge_reduction = 1.0 - sobel_rep / max(sobel_fr, 1e-6)
+
+                        # Untouched check: if repair did not modify the watermark area, FAIL
+                        if changed_inside_ratio < 0.5:
+                            gain_ok = False
+                        elif src_mae >= 20.0:
+                            gain_ok = actual_gain >= 0.5
                         else:
-                            removal_gain = 1.0 - rep_mae / src_mae
+                            # Low-contrast watermark (contrast comparable to sensor noise):
+                            # requires actual inpainting coverage (>=80% pixels rewritten),
+                            # acceptable PSNR (>=20dB), and no hallucination blowup.
+                            gain_ok = (actual_gain >= 0.2) or (
+                                changed_inside_ratio >= 0.8
+                                and q["inside_psnr"] >= 20.0
+                                and rep_mae <= src_mae + 1.5
+                            )
 
                         pixel_pass = (
                             det_ok
@@ -166,7 +193,7 @@ def run_e2e_gate(dataset_dir: str | Path, sample_frames: int = 2) -> dict:
                             and m.recall >= 0.3
                             and q["outside_psnr"] >= 30
                             and outside_exact_ratio >= 0.95
-                            and removal_gain >= 0.5
+                            and gain_ok
                         )
                     else:
                         # Clean frame (watermark 100% transparent or absent):
@@ -200,6 +227,8 @@ def run_e2e_gate(dataset_dir: str | Path, sample_frames: int = 2) -> dict:
                             "source_inside_mae": round(src_mae, 2),
                             "repaired_inside_mae": round(rep_mae, 2),
                             "removal_gain": round(removal_gain, 3),
+                            "changed_inside_ratio": round(changed_inside_ratio, 4),
+                            "edge_reduction": round(edge_reduction, 4),
                         },
                         "gate_pass": pixel_pass,
                     })
@@ -218,7 +247,7 @@ def run_e2e_gate(dataset_dir: str | Path, sample_frames: int = 2) -> dict:
                     for box in boxes:
                         seg = worker.segment_frame(fr, box=box)
                         mask = np.maximum(mask, seg["mask"])
-                    rep = lama.inpaint(fr, mask)
+                    rep = _inpaint_frame(fr, mask, worker=lama)
                     seq.append(rep)
                     seq_clean.append(cl)
                     seq_gt_masks.append(gt_m)
